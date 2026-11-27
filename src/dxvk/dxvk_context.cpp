@@ -7956,14 +7956,17 @@ namespace dxvk {
           std::min(int32_t(renderSize.width),  int32_t(std::max(0.0f, viewport.x + viewport.width))),
           std::min(int32_t(renderSize.height), int32_t(std::max(0.0f, std::max(viewport.y, viewport.y + viewport.height)))) };
 
-        hi.x = std::max(hi.x, lo.x);
-        hi.y = std::max(hi.y, lo.y);
+        // Moving the start into the viewport must not move the scissor's end.
+        auto clippedExtent = [](int32_t origin, uint32_t extent, int32_t lo, int32_t hi) {
+          int64_t end = std::min<int64_t>(int64_t(origin) + extent, hi);
+          return uint32_t(std::max<int64_t>(0, end - lo));
+        };
 
         auto& dst = clampedScissors[i];
         dst.offset = lo;
         dst.extent = VkExtent2D {
-          std::min(scissor.extent.width,  uint32_t(hi.x - lo.x)),
-          std::min(scissor.extent.height, uint32_t(hi.y - lo.y)) };
+          clippedExtent(scissor.offset.x, scissor.extent.width, lo.x, hi.x),
+          clippedExtent(scissor.offset.y, scissor.extent.height, lo.y, hi.y) };
 
         // Extend render area based on the final scissor rect
         adjustRenderArea(dst, false);

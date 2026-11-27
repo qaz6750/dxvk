@@ -29,9 +29,12 @@ inline PrimaryStatus primaryPlan(const PrimaryShape& shape, PrimaryPlan& output)
   // The display owns one unrotated BGRA source. An optional backbuffer
   // can still be copied when its dimensions differ from the mode.
   PrimaryPlan plan;
+  // NONPREROTATED requests storage in the supplied orientation, including
+  // when the output mode reports a rotation. Keep the native dimensions.
+  const bool scanoutOrientation = shape.rotation <= 1 || (shape.flags & 2u);
   plan.scanout = bgra && !shape.source && shape.width == shape.modeWidth
       && shape.height == shape.modeHeight && shape.format == shape.modeFormat
-      && shape.rotation <= 1 && shape.scanline <= 1;
+      && scanoutOrientation && shape.scanline <= 1;
   if (!plan.scanout && !(shape.flags & 1u)) return PrimaryStatus::Unsupported;
   plan.driverFlags = plan.scanout ? 0 : 1;
   output = plan;

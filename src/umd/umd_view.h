@@ -21,7 +21,7 @@ inline bool textureMiscFlags(const D3D10DDIARG_CREATERESOURCE& args, UINT& flags
   flags = 0;
   if (shared) *shared = false;
   constexpr UINT known = D3D10_DDI_RESOURCE_AUTO_GEN_MIP_MAP | D3D10_DDI_RESOURCE_MISC_SHARED;
-  if (args.MiscFlags & ~known) return false;
+  if (resourceMiscFlags(args) & ~known) return false;
   if (args.ResourceDimension == D3D10DDIRESOURCE_TEXTURECUBE)
     flags = D3D11_RESOURCE_MISC_TEXTURECUBE;
   if (args.MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) {

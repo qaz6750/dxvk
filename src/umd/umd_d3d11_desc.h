@@ -15,7 +15,7 @@ constexpr bool resource11Flags(const D3D11DDIARG_CREATERESOURCE& native,
     | D3D11_DDI_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_DDI_RESOURCE_MISC_RESOURCE_CLAMP;
   constexpr UINT bind = D3D10_DDI_BIND_PIPELINE_MASK | D3D10_DDI_BIND_PRESENT
     | D3D11_DDI_BIND_UNORDERED_ACCESS;
-  if ((native.MiscFlags & ~known) || (native.BindFlags & ~bind)
+  if ((resourceMiscFlags(native) & ~known) || (native.BindFlags & ~bind)
       || (native.MapFlags & ~D3D10_DDI_CPU_ACCESS_MASK)) return false;
   misc = 0;
   bindings = native.BindFlags & D3D10_DDI_BIND_PIPELINE_MASK;

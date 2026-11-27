@@ -28,7 +28,7 @@ inline HRESULT primaryResourcePlan(const D3D10DDIARG_CREATERESOURCE& args,
   if (!(args.BindFlags & D3D10_DDI_BIND_PRESENT)) return E_INVALIDARG;
   if (args.ResourceDimension != D3D10DDIRESOURCE_TEXTURE2D || args.MipLevels != 1
       || args.ArraySize != 1 || args.Usage != D3D10_DDI_USAGE_DEFAULT || args.MapFlags
-      || (args.MiscFlags & ~D3D10_DDI_RESOURCE_MISC_SHARED) || args.SampleDesc.Count != 1 || args.SampleDesc.Quality
+      || (resourceMiscFlags(args) & ~D3D10_DDI_RESOURCE_MISC_SHARED) || args.SampleDesc.Count != 1 || args.SampleDesc.Quality
       || !(args.BindFlags & D3D10_DDI_BIND_RENDER_TARGET)) return DXGI_DDI_ERR_UNSUPPORTED;
   const auto& shape = args.pMipInfoList[0];
   if (shape.TexelDepth != 1 || shape.PhysicalDepth != 1 || shape.TexelWidth > shape.PhysicalWidth

@@ -16,7 +16,7 @@ HRESULT createResourceData11(Device* device, const D3D11DDIARG_CREATERESOURCE* a
     // Paired KMD allocations currently describe only a plain 2D image. Keep
     // the existing shared/present ownership path and reject extra semantics.
     constexpr UINT legacyMisc = D3D10_DDI_RESOURCE_AUTO_GEN_MIP_MAP | D3D10_DDI_RESOURCE_MISC_SHARED;
-    if (args->ByteStride || (args->MiscFlags & ~legacyMisc)
+    if (args->ByteStride || (dxvk::umd::resourceMiscFlags(*args) & ~legacyMisc)
         || (args->BindFlags & D3D11_DDI_BIND_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
     const auto legacy = dxvk::umd::resource10Fields(*args);
     return createResourceData(device, &legacy, resource, runtime);

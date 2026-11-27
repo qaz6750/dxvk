@@ -9,6 +9,11 @@ Logger Logger::s_instance("");
 }
 
 namespace dxvk::umd {
+HRESULT getAttachmentFormatSupport(ID3D11Device* device, DXGI_FORMAT format,
+                                   UINT* support, UINT* sampleCounts) {
+  return static_cast<D3D11Device*>(device)->GetFormatSupportFlags(format, support, nullptr, sampleCounts);
+}
+
 HRESULT flushRuntimeSubmission(ID3D11DeviceContext* context) noexcept {
   try { return static_cast<D3D11ImmediateContext*>(context)->FlushRuntimeSubmission(); }
   catch (...) { return DXGI_ERROR_DEVICE_REMOVED; }

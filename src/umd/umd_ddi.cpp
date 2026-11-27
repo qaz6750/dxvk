@@ -1438,10 +1438,7 @@ void APIENTRY checkFormat(D3D10DDI_HDEVICE h, DXGI_FORMAT format, UINT* output) 
 void APIENTRY checkMultisample(D3D10DDI_HDEVICE h, DXGI_FORMAT format, UINT count, UINT* output) {
   auto device = get(h);
   try {
-    const HRESULT hr = dxvk::umd::queryNativeMultisampleLevels(format, count, output,
-      [&](DXGI_FORMAT queried, UINT samples, UINT* levels) {
-        return device->backend->CheckMultisampleQualityLevels(queried, samples, levels);
-      });
+    const HRESULT hr = dxvk::umd::queryNativeMultisampleLevels(device->backend.Get(), format, count, output);
     device->error(hr);
   }
   catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }

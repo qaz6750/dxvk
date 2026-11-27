@@ -1,8 +1,8 @@
 #pragma once
 // SPDX-License-Identifier: MIT
+#include "umd_api.h"
 #include "umd_ddi.h"
 #include "umd_multisample_policy.h"
-#include <d3d11.h>
 
 namespace dxvk::umd {
 
@@ -16,7 +16,7 @@ inline UINT nativeFormatCaps(DXGI_FORMAT format, UINT api) {
     case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-      api &= ~D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+      api &= ~(D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL);
       break;
     default:
       break;
@@ -27,9 +27,10 @@ inline UINT nativeFormatCaps(DXGI_FORMAT format, UINT api) {
   if (api & D3D11_FORMAT_SUPPORT_RENDER_TARGET) {
     result |= D3D10_DDI_FORMAT_SUPPORT_RENDERTARGET;
     if (api & D3D11_FORMAT_SUPPORT_BLENDABLE) result |= D3D10_DDI_FORMAT_SUPPORT_BLENDABLE;
-    if (api & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET)
-      result |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
   }
+  if ((api & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL))
+      && (api & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET))
+    result |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
   if (api & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD) result |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
   return result;
 }
@@ -52,17 +53,35 @@ HRESULT queryNativeFormatCaps(DXGI_FORMAT format, UINT* output, Check&& check) {
   return S_OK;
 }
 
-template<typename Check>
-HRESULT queryNativeMultisampleLevels(DXGI_FORMAT format, UINT count, UINT* output, Check&& check) {
+inline HRESULT queryNativeMultisampleLevels(ID3D11Device* device, DXGI_FORMAT format,
+                                           UINT count, UINT* output) {
   if (!output) return E_INVALIDARG;
   *output = 0;
+  if (count > 1 && format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) return S_OK;
   HRESULT hr = S_OK;
   uint32_t levels = 0;
   const bool complete = multisampleQualityLevels(count, levels, [&](uint32_t& staged) {
-    // Query even for count1: a nonexistent format must still report the
-    // backend's error. Normalize only an actual successful query.
-    hr = check(format, count, &staged);
-    return hr == S_OK;
+    // Preserve format validation for single-sample and non-power-of-two queries.
+    if (count == 1 || (count & (count - 1))) {
+      hr = device->CheckMultisampleQualityLevels(format, count, &staged);
+      return hr == S_OK;
+    }
+
+    UINT samples = 0;
+    UINT support = 0;
+    hr = getAttachmentFormatSupport(device, format, &support, &samples);
+    if (hr == E_FAIL) {
+      // A missing attachment can still be a valid sampled format. Keep the
+      // backend's format error, but never publish its sampled-image levels.
+      UINT ignored = 0;
+      hr = device->CheckMultisampleQualityLevels(format, count, &ignored);
+      return hr == S_OK;
+    }
+    if (hr != S_OK) return false;
+    const UINT caps = nativeFormatCaps(format, support);
+    if ((caps & D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET) && (samples & count))
+      staged = 1;
+    return true;
   });
   if (!complete) return FAILED(hr) ? hr : E_FAIL;
   *output = levels;

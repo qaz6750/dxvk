@@ -438,6 +438,12 @@ namespace dxvk {
       return m_dxvkDevice->getShaderPipelineStages();
     }
     
+    HRESULT GetFormatSupportFlags(
+            DXGI_FORMAT             Format,
+            UINT*                   pFlags1,
+            UINT*                   pFlags2,
+            VkSampleCountFlags*     pAttachmentSamples = nullptr) const;
+
     DXGI_VK_FORMAT_INFO LookupFormat(
             DXGI_FORMAT           Format,
             DXGI_VK_FORMAT_MODE   Mode) const;
@@ -544,11 +550,6 @@ namespace dxvk {
             UINT                    NumStrides,
             UINT                    RasterizedStream);
 
-    HRESULT GetFormatSupportFlags(
-            DXGI_FORMAT             Format,
-            UINT*                   pFlags1,
-            UINT*                   pFlags2) const;
-    
     BOOL GetImageTypeSupport(
             VkFormat                Format,
             VkImageType             Type,

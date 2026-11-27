@@ -2308,12 +2308,14 @@ namespace dxvk {
   }
 
 
-  HRESULT D3D11Device::GetFormatSupportFlags(DXGI_FORMAT Format, UINT* pFlags1, UINT* pFlags2) const {
+  HRESULT D3D11Device::GetFormatSupportFlags(DXGI_FORMAT Format, UINT* pFlags1, UINT* pFlags2,
+                                             VkSampleCountFlags* pAttachmentSamples) const {
     const DXGI_VK_FORMAT_INFO fmtMapping = LookupFormat(Format, DXGI_VK_FORMAT_MODE_ANY);
 
     // Reset output flags preemptively
     if (pFlags1 != nullptr) *pFlags1 = 0;
     if (pFlags2 != nullptr) *pFlags2 = 0;
+    if (pAttachmentSamples) *pAttachmentSamples = 0;
 
     // Unsupported or invalid format
     if (Format && fmtMapping.Format == VK_FORMAT_UNDEFINED)
@@ -2457,6 +2459,8 @@ namespace dxvk {
       formatQuery.usage = usage;
 
       auto limits = m_dxvkDevice->getFormatLimits(formatQuery);
+
+      if (limits && pAttachmentSamples) *pAttachmentSamples = limits->sampleCounts;
 
       if (limits && limits->sampleCounts > VK_SAMPLE_COUNT_1_BIT) {
         flags1 |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET

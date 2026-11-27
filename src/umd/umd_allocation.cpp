@@ -53,6 +53,7 @@ void RuntimeMemory::initialize(HANDLE rtDevice, const D3DDDI_DEVICECALLBACKS& cb
                                const DXGI_DDI_BASE_CALLBACKS* dxgiCallbacks) {
   device = rtDevice;
   dxgi = dxgiCallbacks;
+  if (!dxgi) callbacks.pfnPresentCb = cb.pfnPresentCb;
   callbacks.pfnAllocateCb = cb.pfnAllocateCb;
   callbacks.pfnDeallocate2Cb = cb.pfnDeallocate2Cb;
   callbacks.pfnLock2Cb = cb.pfnLock2Cb;
@@ -104,10 +105,13 @@ HRESULT RuntimeMemory::allocate(RuntimeAllocation& out, HANDLE resource, UINT wi
   HRESULT hr = callbacks.pfnAllocateCb(device, &request);
   binding->pendingAllocate = nullptr;
   if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
-  if (FAILED(hr)) return hr;
-  binding->resource = resource;
-  binding->handle = info.hAllocation;
-  return hr == S_OK && binding->handle ? S_OK : E_FAIL;
+  if (info.hAllocation) {
+    binding->resource = resource;
+    binding->handle = info.hAllocation;
+  }
+  if (hr == S_OK && binding->handle) return S_OK;
+  out.release();
+  return FAILED(hr) ? hr : E_FAIL;
 }
 HRESULT RuntimeMemory::adopt(RuntimeAllocation& out, D3DKMT_HANDLE allocation, const qcdx_alloc& layout) {
   if (!available() || out.surface || !allocation || !validSurface(layout)) return E_INVALIDARG;
@@ -193,8 +197,7 @@ HRESULT RuntimeMemory::setDisplayMode(RuntimeAllocation& out, const Live& live) 
   mode.hPrimaryAllocation = out.handle();
   return callbacks.pfnSetDisplayModeCb(device, &mode);
 }
-HRESULT RuntimeMemory::present(RuntimeAllocation& source, const DXGI_DDI_ARG_PRESENT& args,
-                              const Live& live, D3DKMT_HANDLE destination) {
+HRESULT RuntimeMemory::ensureContext(const Live& live) {
   if (!available() || !live()) return DXGI_ERROR_DEVICE_REMOVED;
   if (!context) {
     if (pendingContext) return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -208,6 +211,20 @@ HRESULT RuntimeMemory::present(RuntimeAllocation& source, const DXGI_DDI_ARG_PRE
     context = create.hContext;
     if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
   }
+  return S_OK;
+}
+HRESULT RuntimeMemory::present9(RuntimeAllocation& source, const Live& live) {
+  HRESULT hr = ensureContext(live);
+  if (FAILED(hr)) return hr;
+  D3DDDICB_PRESENT request = {};
+  request.hSrcAllocation = source.handle();
+  request.hContext = context;
+  return callbacks.pfnPresentCb(device, &request);
+}
+HRESULT RuntimeMemory::present(RuntimeAllocation& source, const DXGI_DDI_ARG_PRESENT& args,
+                              const Live& live, D3DKMT_HANDLE destination) {
+  HRESULT hr = ensureContext(live);
+  if (FAILED(hr)) return hr;
   DXGIDDICB_PRESENT present = {};
   present.hSrcAllocation = source.handle();
   present.hDstAllocation = destination;

@@ -1,3 +1,4 @@
 LIBRARY qcdx_dxvk
 EXPORTS
+    OpenAdapter10
     OpenAdapter10_2

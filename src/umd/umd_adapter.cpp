@@ -1,6 +1,6 @@
 // Adapted from sunflower2333's native D3D11 adapter (Kancy Joe).
 #include "umd_adapter.h"
-#include "qcdx_escape.h"
+#include "umd_luid.h"
 #include <mutex>
 #include <cstring>
 #include <algorithm>
@@ -24,7 +24,7 @@ SIZE_T APIENTRY sizeDevice(D3D10DDI_HADAPTER handle, const D3D10DDIARG_CALCPRIVA
 }
 HRESULT APIENTRY createDevice(D3D10DDI_HADAPTER handle, D3D10DDIARG_CREATEDEVICE* args) {
   auto identity = retain(handle);
-  if (!identity || !args || !args->pKTCallbacks || !args->p11UMCallbacks || !args->p11DeviceFuncs
+  if (!identity || !args || !args->pKTCallbacks
       || !args->DXGIBaseDDI.pDXGIBaseCallbacks || !args->DXGIBaseDDI.pDXGIDDIBaseFunctions)
     return E_INVALIDARG;
   if (!supportedNativeInterface(args->Interface, args->Version, args->Flags)) return DXGI_ERROR_UNSUPPORTED;
@@ -42,7 +42,8 @@ HRESULT APIENTRY closeAdapter(D3D10DDI_HADAPTER handle) {
 }
 HRESULT APIENTRY versions(D3D10DDI_HADAPTER handle, UINT* count, UINT64* output) {
   if (!count || !retain(handle)) return E_INVALIDARG;
-  constexpr UINT64 values[] = {D3D11_0_DDI_SUPPORTED, D3D11_0_7_DDI_SUPPORTED};
+  constexpr UINT64 values[] = {D3D11_0_DDI_SUPPORTED, D3D11_0_7_DDI_SUPPORTED,
+    D3D10_0_DDI_SUPPORTED, D3D10_0_7_DDI_SUPPORTED};
   const auto capacity = output ? *count : 0;
   *count = UINT(std::size(values));
   if (output && capacity < *count) return E_OUTOFMEMORY;
@@ -70,34 +71,40 @@ HRESULT APIENTRY caps(D3D10DDI_HADAPTER handle, const D3D10_2DDIARG_GETCAPS* arg
 }
 }
 
-extern "C" HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER* args) {
-  if (!args || !args->hRTAdapter.handle || !args->pAdapterFuncs_2 ||
+template<typename Table>
+static HRESULT openAdapter(D3D10DDIARG_OPENADAPTER* args, Table* output) {
+  if (!args || !args->hRTAdapter.handle || !output ||
       !args->pAdapterCallbacks || !args->pAdapterCallbacks->pfnQueryAdapterInfoCb) return E_INVALIDARG;
   args->hAdapter = {};
-  qcdx_adapter_info_luid info = {};
-  static_assert(sizeof(info) == 24);
-  D3DDDICB_QUERYADAPTERINFO query = {};
-  query.pPrivateDriverData = &info;
-  query.PrivateDriverDataSize = sizeof(info);
-  HRESULT hr = args->pAdapterCallbacks->pfnQueryAdapterInfoCb(args->hRTAdapter.handle, &query);
+  LUID luid;
+  HRESULT hr = dxvk::umd::queryAdapterLuid(args->hRTAdapter.handle, *args->pAdapterCallbacks, luid);
   if (FAILED(hr)) return hr;
-  if (hr != S_OK || info.base.magic != QCDX_ESC_MAGIC ||
-      !(info.base.features & QCDX_CAP_VIDMM_GPUVA) || !(info.luid_low || info.luid_high))
-    return DXGI_ERROR_UNSUPPORTED;
   try {
     auto identity = std::make_shared<dxvk::umd::AdapterIdentity>();
-    identity->luid = {info.luid_low, info.luid_high};
+    identity->luid = luid;
     std::lock_guard lock(adaptersMutex);
     if (!nextToken) return E_OUTOFMEMORY;
     auto token = reinterpret_cast<void*>(nextToken++);
     adapters.emplace(token, std::move(identity));
-    auto& table = *args->pAdapterFuncs_2;
+    auto& table = *output;
     table.pfnCalcPrivateDeviceSize = sizeDevice;
     table.pfnCreateDevice = createDevice;
     table.pfnCloseAdapter = closeAdapter;
-    table.pfnGetSupportedVersions = versions;
-    table.pfnGetCaps = caps;
+    if constexpr (std::is_same_v<Table, D3D10_2DDI_ADAPTERFUNCS>) {
+      table.pfnGetSupportedVersions = versions;
+      table.pfnGetCaps = caps;
+    }
     args->hAdapter.pDrvPrivate = token;
     return S_OK;
   } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
+extern "C" HRESULT APIENTRY OpenAdapter10(D3D10DDIARG_OPENADAPTER* args) {
+  if (!args) return E_INVALIDARG;
+  if (!dxvk::umd::isD3D10Interface(args->Interface)) return DXGI_ERROR_UNSUPPORTED;
+  return openAdapter(args, args->pAdapterFuncs);
+}
+
+extern "C" HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER* args) {
+  return args ? openAdapter(args, args->pAdapterFuncs_2) : E_INVALIDARG;
 }

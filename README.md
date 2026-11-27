@@ -183,21 +183,25 @@ DXVK Native comes with a slim set of Windows header definitions required for D3D
 In most cases, it will end up being plug and play with your renderer, but there may be certain teething issues such as:
 - `__uuidof(type)` is supported, but `__uuidof(variable)` is not supported. Use `__uuidof_var(variable)` instead.
 
-## Haydn native D3D11 user-mode driver
+## Haydn native Direct3D user-mode driver
 
-The ARM64 target `qcdx_dxvk.dll` exposes the Windows D3D11 driver DDI
+The ARM64 target `qcdx_dxvk.dll` exposes the Windows D3D9, D3D10.0 and D3D11 DDIs
 and selects the Turnip physical device with the miniport's adapter LUID.
-It negotiates D3D11 with feature level 10_0. Shared textures and display
+D3D9 supports windowed blit presentation and shader model 2.0. D3D10
+and D3D11 negotiate feature level 10_0. Shared textures and display
 buffers use the qcdx VidMM allocation ABI. Transfers between a Vulkan
 image and a linear VidMM surface use synchronized staging.
 
 The native DDI frontend, shader reconstruction, shared-surface handling
 and staging-busy query were ported from Kancy Joe (sunflower2333)'s
 Windows adaptation at revision `e26d0acd2428515dd941612a67149216c048f01e`.
-Haydn provides the adapter, allocation and presentation integration.
+The D3D9 device DDI and fog handling also incorporate that port's
+`0841399388bc69eaa3f46da9fa31646d4b99a18b` revision. Haydn provides
+the adapter, allocation and presentation integration.
 Upstream source and history: https://github.com/sunflower2333/dxvk
 
-Enable `-Denable_qcdx_umd=true` in a Windows ARM64 D3D11 build with the
+Enable `-Denable_qcdx_umd=true` in a Windows ARM64 D3D9 and D3D11 build
+with the
 WDK headers, and set the Meson cross-file property `qcdx_abi_include_dir`
 to `qcdxkm/kmd/driver/inc`. Build `src/umd/qcdx_dxvk.dll`. The matching
 miniport and Turnip manifest are in the qcdx WDDM 2.0 render package.

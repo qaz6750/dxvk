@@ -44,7 +44,7 @@ public:
   using Live = std::function<bool()>;
   void initialize(HANDLE device, const D3DDDI_DEVICECALLBACKS& callbacks,
                   const DXGI_DDI_BASE_CALLBACKS* dxgi);
-  bool available() const { return device && !closing && dxgi && dxgi->pfnPresentCb; }
+  bool available() const { return device && !closing && (dxgi ? dxgi->pfnPresentCb != nullptr : callbacks.pfnPresentCb != nullptr); }
   bool primaryAvailable() const { return available() && callbacks.pfnSetDisplayModeCb; }
   HRESULT allocate(RuntimeAllocation& out, HANDLE resource, UINT width, UINT height,
                    DXGI_FORMAT format, bool primary = false);
@@ -54,12 +54,14 @@ public:
   HRESULT setDisplayMode(RuntimeAllocation& primary, const Live& live);
   HRESULT present(RuntimeAllocation& source, const DXGI_DDI_ARG_PRESENT& args,
                   const Live& live, D3DKMT_HANDLE destination);
+  HRESULT present9(RuntimeAllocation& source, const Live& live);
   HRESULT queryResidency(const D3DKMT_HANDLE* handles, UINT count,
                          D3DDDI_RESIDENCYSTATUS* status, const Live& live);
   HRESULT setPriority(D3DKMT_HANDLE allocation, UINT priority, const Live& live);
   HRESULT closeDeviceAllocations();
 private:
   friend class RuntimeAllocation;
+  HRESULT ensureContext(const Live& live);
   HRESULT transfer(RuntimeAllocation& out, void* data, UINT pitch, bool upload);
   HRESULT release(const std::shared_ptr<VidmmSurface>& surface);
   HANDLE device = nullptr, context = nullptr;

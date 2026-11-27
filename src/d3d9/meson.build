@@ -16,7 +16,6 @@ d3d9_shaders = files([
 ])
 
 d3d9_src = [
-  'd3d9_main.cpp',
   'd3d9_interface.cpp',
   'd3d9_adapter.cpp',
   'd3d9_monitor.cpp',
@@ -62,7 +61,7 @@ if platform != 'windows'
   d3d9_link_depends += files('d3d9.sym')
 endif
 
-d3d9_dll = shared_library(module_name, d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
+d3d9_dll = shared_library(module_name, d3d9_src, 'd3d9_main.cpp', glsl_generator.process(d3d9_shaders), d3d9_res,
   dependencies        : [ dxbc_spirv_dep, dxvk_dep ],
   include_directories : dxvk_include_path,
   install             : true,
@@ -82,4 +81,8 @@ if platform != 'windows'
     filebase: dxvk_pkg_prefix + 'd3d9',
     subdirs:  'dxvk',
   )
+endif
+
+if get_option('enable_qcdx_umd')
+  qcdx_d3d9_objects = d3d9_dll.extract_objects(d3d9_src)
 endif

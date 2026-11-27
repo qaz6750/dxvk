@@ -1,0 +1,546 @@
+// Adapted from sunflower2333's native DXVK D3D9 driver (Kancy Joe).
+#include "umd_d3d9_backend.h"
+#include "umd_renderer.h"
+#include "../d3d9/d3d9_interface.h"
+#include "../d3d9/d3d9_device.h"
+#include "../d3d9/d3d9_buffer.h"
+#include <dxgi.h>
+#include <new>
+#include <vector>
+#include <climits>
+
+namespace dxvk::umd {
+
+struct D3D9Backend::State {
+  Rc<DxvkDevice> device;
+  Com<D3D9InterfaceEx> parent;
+  Com<D3D9DeviceEx> d3d;
+};
+
+struct D3D9SurfaceResource::State {
+  Com<IDirect3DSurface9> surface;
+  Com<IDirect3DSurface9> readback;
+  D3D9SurfaceDesc desc;
+  D3DLOCKED_RECT mapping = {};
+  RECT area = {};
+  bool locked = false, readOnly = false;
+};
+D3D9SurfaceResource::D3D9SurfaceResource() : m_state(std::make_unique<State>()) { }
+D3D9SurfaceResource::~D3D9SurfaceResource() = default;
+
+struct D3D9TextureResource::State {
+  Com<IDirect3DTexture9> texture;
+};
+D3D9TextureResource::D3D9TextureResource() : m_state(std::make_unique<State>()) { }
+D3D9TextureResource::~D3D9TextureResource() = default;
+
+struct D3D9VertexDeclaration::State {
+  Com<IDirect3DVertexDeclaration9> declaration;
+};
+D3D9VertexDeclaration::D3D9VertexDeclaration() : m_state(std::make_unique<State>()) { }
+D3D9VertexDeclaration::~D3D9VertexDeclaration() = default;
+
+struct D3D9Shader::State {
+  Com<IDirect3DVertexShader9> vertex;
+  Com<IDirect3DPixelShader9> pixel;
+};
+D3D9Shader::D3D9Shader() : m_state(std::make_unique<State>()) { }
+D3D9Shader::~D3D9Shader() = default;
+
+struct D3D9QueryResource::State {
+  Com<IDirect3DQuery9> query;
+};
+D3D9QueryResource::D3D9QueryResource() : m_state(std::make_unique<State>()) { }
+D3D9QueryResource::~D3D9QueryResource() = default;
+
+HRESULT D3D9Backend::createQuery(D3DQUERYTYPE type, std::unique_ptr<D3D9QueryResource>& output) {
+  auto query = std::make_unique<D3D9QueryResource>();
+  const HRESULT hr = m_state->d3d->CreateQuery(type, &query->m_state->query);
+  if (hr != S_OK || !query->m_state->query) return FAILED(hr) ? hr : E_FAIL;
+  output = std::move(query);
+  return S_OK;
+}
+HRESULT D3D9Backend::issueQuery(D3D9QueryResource& query, DWORD flags) {
+  return query.m_state->query->Issue(flags);
+}
+HRESULT D3D9Backend::getQueryData(D3D9QueryResource& query, void* data, UINT bytes) {
+  if (data && bytes != query.m_state->query->GetDataSize()) return E_INVALIDARG;
+  return query.m_state->query->GetData(data, bytes, 0);
+}
+
+struct D3D9BufferResource::State {
+  Com<IDirect3DVertexBuffer9> vertex;
+  Com<IDirect3DIndexBuffer9> index;
+  D3D9BufferDesc desc;
+  void* mapping = nullptr;
+  UINT offset = 0, bytes = 0;
+  bool readOnly = false;
+};
+D3D9BufferResource::D3D9BufferResource() : m_state(std::make_unique<State>()) { }
+D3D9BufferResource::~D3D9BufferResource() = default;
+
+D3D9Backend::D3D9Backend() : m_state(std::make_unique<State>()) { }
+D3D9Backend::~D3D9Backend() = default;
+HRESULT D3D9Backend::status() const noexcept {
+  return m_state->device->getDeviceStatus() == VK_SUCCESS ? S_OK : D3DERR_DEVICELOST;
+}
+HRESULT D3D9Backend::validateDevice(UINT& passes) {
+  DWORD actual = 0;
+  const HRESULT hr = m_state->d3d->ValidateDevice(&actual);
+  if (hr == S_OK) passes = actual;
+  return hr;
+}
+HRESULT D3D9Backend::flush() noexcept {
+  try { return m_state->d3d->FlushRuntimeSubmission(); }
+  catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+  catch (...) { return D3DERR_DEVICELOST; }
+}
+
+HRESULT D3D9Backend::createBuffer(const D3D9BufferDesc& desc,
+    std::unique_ptr<D3D9BufferResource>& output, const void* initialData) {
+  auto buffer = std::make_unique<D3D9BufferResource>();
+  buffer->m_state->desc = desc;
+  const auto pool = desc.systemMemory ? D3DPOOL_SYSTEMMEM : D3DPOOL_DEFAULT;
+  // A borrowed MightDrawFromLocked VB stays in CPU storage. DXVK's dynamic
+  // SYSTEMMEM path copies it into owned per-draw storage without unlocking
+  // the runtime's buffer, including when its native Dynamic hint is absent.
+  const DWORD usage = ((desc.dynamic || desc.mightDrawFromLocked) ? D3DUSAGE_DYNAMIC : 0)
+    | (desc.writeOnly ? D3DUSAGE_WRITEONLY : 0);
+  const HRESULT hr = desc.index
+    ? m_state->d3d->CreateIndexBuffer(desc.bytes, usage, desc.format, pool, &buffer->m_state->index, nullptr)
+    : m_state->d3d->CreateVertexBuffer(desc.bytes, usage, desc.fvf, pool, &buffer->m_state->vertex, nullptr);
+  if (hr != S_OK || !(desc.index ? bool(buffer->m_state->index) : bool(buffer->m_state->vertex)))
+    return FAILED(hr) ? hr : E_FAIL;
+  if (initialData) {
+    void* data = nullptr;
+    const HRESULT locked = lockBuffer(*buffer, 0, desc.bytes, 0, data);
+    if (locked != S_OK) return locked;
+    if (!buffer->m_state->mapping) { unlockBuffer(*buffer); return E_FAIL; }
+    std::memcpy(buffer->m_state->mapping, initialData, desc.bytes);
+    const HRESULT unlocked = unlockBuffer(*buffer);
+    if (unlocked != S_OK) return unlocked;
+  }
+  output = std::move(buffer);
+  return S_OK;
+}
+HRESULT D3D9Backend::lockBuffer(D3D9BufferResource& buffer, UINT offset, UINT bytes, DWORD flags, void*& data) {
+  auto& state = *buffer.m_state;
+  void* mapping = nullptr;
+  const HRESULT hr = state.index ? state.index->Lock(offset, bytes, &mapping, flags)
+                                : state.vertex->Lock(offset, bytes, &mapping, flags);
+  if (hr != S_OK) return hr;
+  state.mapping = mapping; state.offset = offset; state.bytes = bytes;
+  state.readOnly = (flags & D3DLOCK_READONLY) != 0;
+  data = mapping;
+  if (mapping && state.desc.systemData) {
+    data = static_cast<uint8_t*>(state.desc.systemData) + offset;
+    if (state.readOnly) std::memcpy(data, mapping, bytes);
+  }
+  return S_OK;
+}
+HRESULT D3D9Backend::unlockBuffer(D3D9BufferResource& buffer, const void* upload) {
+  auto& state = *buffer.m_state;
+  if (upload && !state.readOnly) {
+    if (!state.mapping) return E_FAIL;
+    std::memcpy(state.mapping, upload, state.bytes);
+  }
+  const HRESULT hr = state.index ? state.index->Unlock() : state.vertex->Unlock();
+  if (hr == S_OK) state.mapping = nullptr;
+  return hr;
+}
+HRESULT D3D9Backend::syncBufferForDraw(D3D9BufferResource& buffer, const void* snapshot, UINT bytes) {
+  const auto& state = *buffer.m_state;
+  if (!snapshot || bytes != state.desc.bytes || !state.desc.mightDrawFromLocked
+      || !state.desc.systemMemory || !state.desc.systemData || state.desc.index || !state.vertex)
+    return E_INVALIDARG;
+  auto lock = m_state->d3d->LockDevice();
+  auto* common = static_cast<D3D9VertexBuffer*>(state.vertex.ptr())->GetCommonBuffer();
+  const auto storage = common->GetMappedSlice();
+  if (!common->DoPerDrawUpload() || !storage || !storage->mapPtr()) return E_FAIL;
+  // The caller captured these bytes before any runtime callback. Never
+  // dereference its borrowed memory from the renderer worker or release its
+  // outstanding lock. Draw captures this CPU storage before queuing GPU work.
+  std::memcpy(storage->mapPtr(), snapshot, bytes);
+  common->DirtyRange().Conjoin(D3D9Range(0, bytes));
+  // Mixed or unused bound streams can make DXVK take its regular GPU-buffer
+  // path instead of per-draw SYSTEMMEM uploads. Queue this owned copy every
+  // time, even after the first draw cleared its stream-upload tracking bit.
+  // FlushBuffer preserves the runtime/private lock and orders the copy ahead
+  // of Draw; it never calls Unlock on the borrowed buffer.
+  return m_state->d3d->FlushBuffer(common);
+}
+HRESULT D3D9Backend::copyBuffer(D3D9BufferResource& destination, UINT destinationOffset,
+    D3D9BufferResource& source, UINT sourceOffset, UINT bytes, const void* upload) {
+  auto common = [](D3D9BufferResource::State& state) {
+    return state.index ? static_cast<D3D9IndexBuffer*>(state.index.ptr())->GetCommonBuffer()
+                       : static_cast<D3D9VertexBuffer*>(state.vertex.ptr())->GetCommonBuffer();
+  };
+  const HRESULT hr = m_state->d3d->CopyNativeBuffer(common(*destination.m_state), destinationOffset,
+    common(*source.m_state), sourceOffset, bytes, upload);
+  if (hr != S_OK || !bytes || !destination.m_state->desc.systemData) return hr;
+  void* data = nullptr;
+  const HRESULT locked = lockBuffer(destination, destinationOffset, bytes, D3DLOCK_READONLY, data);
+  if (locked != S_OK) return locked;
+  if (!data) { unlockBuffer(destination); return E_FAIL; }
+  return unlockBuffer(destination);
+}
+HRESULT D3D9Backend::setStreamSource(UINT stream, D3D9BufferResource* buffer, UINT offset, UINT stride) {
+  return m_state->d3d->SetStreamSource(stream, buffer ? buffer->m_state->vertex.ptr() : nullptr, offset, stride);
+}
+HRESULT D3D9Backend::setStreamSourceFreq(UINT stream, UINT divider) {
+  return m_state->d3d->SetStreamSourceFreq(stream, divider);
+}
+HRESULT D3D9Backend::setIndices(D3D9BufferResource* buffer) {
+  return m_state->d3d->SetIndices(buffer ? buffer->m_state->index.ptr() : nullptr);
+}
+HRESULT D3D9Backend::drawPrimitiveBuffers(D3DPRIMITIVETYPE type, UINT start, UINT count) {
+  return m_state->d3d->DrawPrimitive(type, start, count);
+}
+HRESULT D3D9Backend::drawIndexedPrimitive(D3DPRIMITIVETYPE type, INT base, UINT minimum,
+    UINT vertices, UINT start, UINT count) {
+  return m_state->d3d->DrawIndexedPrimitive(type, base, minimum, vertices, start, count);
+}
+
+HRESULT D3D9Backend::createVertexDeclaration(const D3DVERTEXELEMENT9* elements,
+    std::unique_ptr<D3D9VertexDeclaration>& output) {
+  auto declaration = std::make_unique<D3D9VertexDeclaration>();
+  const HRESULT hr = m_state->d3d->CreateVertexDeclaration(elements, &declaration->m_state->declaration);
+  if (SUCCEEDED(hr)) output = std::move(declaration);
+  return hr;
+}
+HRESULT D3D9Backend::setVertexDeclaration(D3D9VertexDeclaration* declaration) {
+  return m_state->d3d->SetVertexDeclaration(declaration ? declaration->m_state->declaration.ptr() : nullptr);
+}
+HRESULT D3D9Backend::createShader(D3D9ShaderStage stage, const DWORD* code, UINT bytes,
+    std::unique_ptr<D3D9Shader>& output) {
+  auto shader = std::make_unique<D3D9Shader>();
+  const HRESULT hr = stage == D3D9ShaderStage::Vertex
+    ? m_state->d3d->CreateNativeVertexShader(code, bytes, &shader->m_state->vertex)
+    : m_state->d3d->CreateNativePixelShader(code, bytes, &shader->m_state->pixel);
+  if (hr != S_OK || !(stage == D3D9ShaderStage::Vertex ? bool(shader->m_state->vertex) : bool(shader->m_state->pixel)))
+    return FAILED(hr) ? hr : E_FAIL;
+  output = std::move(shader);
+  return S_OK;
+}
+HRESULT D3D9Backend::setShader(D3D9ShaderStage stage, D3D9Shader* shader) {
+  return stage == D3D9ShaderStage::Vertex
+    ? m_state->d3d->SetVertexShader(shader ? shader->m_state->vertex.ptr() : nullptr)
+    : m_state->d3d->SetPixelShader(shader ? shader->m_state->pixel.ptr() : nullptr);
+}
+HRESULT D3D9Backend::setShaderConstantF(D3D9ShaderStage stage, UINT first, UINT count, const float* values) {
+  return stage == D3D9ShaderStage::Vertex ? m_state->d3d->SetVertexShaderConstantF(first, values, count)
+                                        : m_state->d3d->SetPixelShaderConstantF(first, values, count);
+}
+HRESULT D3D9Backend::setShaderConstantI(D3D9ShaderStage stage, UINT first, UINT count, const INT* values) {
+  return stage == D3D9ShaderStage::Vertex ? m_state->d3d->SetVertexShaderConstantI(first, values, count)
+                                        : m_state->d3d->SetPixelShaderConstantI(first, values, count);
+}
+HRESULT D3D9Backend::setShaderConstantB(D3D9ShaderStage stage, UINT first, UINT count, const BOOL* values) {
+  return stage == D3D9ShaderStage::Vertex ? m_state->d3d->SetVertexShaderConstantB(first, values, count)
+                                        : m_state->d3d->SetPixelShaderConstantB(first, values, count);
+}
+HRESULT D3D9Backend::setTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix, bool multiply) {
+  return multiply ? m_state->d3d->MultiplyTransform(state, &matrix)
+                  : m_state->d3d->SetTransform(state, &matrix);
+}
+HRESULT D3D9Backend::setMaterial(const D3DMATERIAL9& material) {
+  return m_state->d3d->SetMaterial(&material);
+}
+HRESULT D3D9Backend::setClipPlane(UINT index, const float* plane) {
+  return m_state->d3d->SetClipPlane(index, plane);
+}
+HRESULT D3D9Backend::setLight(UINT index, const D3DLIGHT9& light) {
+  return m_state->d3d->SetLight(index, &light);
+}
+HRESULT D3D9Backend::setLightEnabled(UINT index, bool enable) {
+  return m_state->d3d->LightEnable(index, enable);
+}
+HRESULT D3D9Backend::setRenderState(D3DRENDERSTATETYPE state, DWORD value) {
+  return m_state->d3d->SetRenderState(state, value);
+}
+HRESULT D3D9Backend::setWInfo(float wNear, float wFar) {
+  return m_state->d3d->SetNativeWInfo(wNear, wFar);
+}
+HRESULT D3D9Backend::setScene(bool capture) {
+  return capture ? m_state->d3d->BeginScene() : m_state->d3d->EndScene();
+}
+HRESULT D3D9Backend::setSoftwareVertexProcessing(bool enable) {
+  return m_state->d3d->SetSoftwareVertexProcessing(enable);
+}
+HRESULT D3D9Backend::setViewport(UINT x, UINT y, UINT width, UINT height) {
+  D3DVIEWPORT9 viewport = {};
+  const HRESULT hr = m_state->d3d->GetViewport(&viewport);
+  if (FAILED(hr)) return hr;
+  viewport.X = x; viewport.Y = y; viewport.Width = width; viewport.Height = height;
+  return m_state->d3d->SetViewport(&viewport);
+}
+HRESULT D3D9Backend::setZRange(float minimum, float maximum) {
+  D3DVIEWPORT9 viewport = {};
+  const HRESULT hr = m_state->d3d->GetViewport(&viewport);
+  if (FAILED(hr)) return hr;
+  viewport.MinZ = minimum; viewport.MaxZ = maximum;
+  return m_state->d3d->SetViewport(&viewport);
+}
+HRESULT D3D9Backend::setScissorRect(const RECT& area) {
+  return m_state->d3d->SetScissorRect(&area);
+}
+HRESULT D3D9Backend::drawPrimitive(D3DPRIMITIVETYPE type, UINT count,
+    const void* vertices, UINT stride) {
+  // The native DDI owns the user-memory binding. The public UP call's
+  // implicit stream-zero unbind must not retire that native binding.
+  return m_state->d3d->DrawPrimitiveUP(type, count, vertices, stride);
+}
+
+HRESULT D3D9Backend::createSurface(const D3D9SurfaceDesc& desc,
+                                 std::unique_ptr<D3D9SurfaceResource>& result) {
+  auto resource = std::make_unique<D3D9SurfaceResource>();
+  auto& state = *resource->m_state;
+  state.desc = desc;
+  const HRESULT hr = desc.depthStencil
+    ? m_state->d3d->CreateDepthStencilSurface(desc.width, desc.height, desc.format,
+        D3DMULTISAMPLE_NONE, 0, FALSE, &state.surface, nullptr)
+    : desc.renderTarget
+    ? m_state->d3d->CreateRenderTarget(desc.width, desc.height, desc.format,
+        D3DMULTISAMPLE_NONE, 0, desc.lockable, &state.surface, nullptr)
+    : m_state->d3d->CreateOffscreenPlainSurface(desc.width, desc.height, desc.format,
+        desc.systemMemory ? D3DPOOL_SYSTEMMEM : D3DPOOL_DEFAULT, &state.surface, nullptr);
+  if (hr != S_OK || !state.surface) return FAILED(hr) ? hr : E_FAIL;
+  result = std::move(resource);
+  return S_OK;
+}
+
+HRESULT D3D9Backend::setRenderTarget(D3D9SurfaceResource* target) {
+  auto surface = target ? target->m_state->surface.ptr() : nullptr;
+  return m_state->d3d->SetNativeRenderTarget(surface);
+}
+
+HRESULT D3D9Backend::setDepthStencil(D3D9SurfaceResource* depth) {
+  return m_state->d3d->SetDepthStencilSurface(depth ? depth->m_state->surface.ptr() : nullptr);
+}
+
+HRESULT D3D9Backend::colorFill(D3D9SurfaceResource& surface, const RECT& area, D3DCOLOR color) {
+  return m_state->d3d->ColorFill(surface.m_state->surface.ptr(), &area, color);
+}
+
+HRESULT D3D9Backend::createTexture(const D3D9SurfaceDesc* levels, UINT count,
+    std::unique_ptr<D3D9TextureResource>& output,
+    std::vector<std::unique_ptr<D3D9SurfaceResource>>& outputSurfaces) {
+  auto texture = std::make_unique<D3D9TextureResource>();
+  const auto& desc = levels[0];
+  HRESULT hr = m_state->d3d->CreateTexture(desc.width, desc.height, count,
+    (desc.renderTarget ? D3DUSAGE_RENDERTARGET : 0)
+      | (desc.dynamic ? D3DUSAGE_DYNAMIC : 0), desc.format,
+    desc.systemMemory ? D3DPOOL_SYSTEMMEM : D3DPOOL_DEFAULT,
+    &texture->m_state->texture, nullptr);
+  if (hr != S_OK || !texture->m_state->texture) return FAILED(hr) ? hr : E_FAIL;
+  if (texture->m_state->texture->GetLevelCount() != count) return E_FAIL;
+  std::vector<std::unique_ptr<D3D9SurfaceResource>> surfaces;
+  surfaces.reserve(count);
+  for (UINT i = 0; i < count; ++i) {
+    auto surface = std::make_unique<D3D9SurfaceResource>();
+    surface->m_state->desc = levels[i];
+    hr = texture->m_state->texture->GetSurfaceLevel(i, &surface->m_state->surface);
+    if (hr != S_OK || !surface->m_state->surface) return FAILED(hr) ? hr : E_FAIL;
+    surfaces.push_back(std::move(surface));
+  }
+  outputSurfaces = std::move(surfaces);
+  output = std::move(texture);
+  return S_OK;
+}
+HRESULT D3D9Backend::setTexture(UINT stage, D3D9TextureResource* texture) {
+  return m_state->d3d->SetTexture(stage, texture ? texture->m_state->texture.ptr() : nullptr);
+}
+HRESULT D3D9Backend::setTextureStageState(UINT stage, D3DTEXTURESTAGESTATETYPE state, DWORD value) {
+  return m_state->d3d->SetTextureStageState(stage, state, value);
+}
+HRESULT D3D9Backend::setSamplerState(UINT stage, D3DSAMPLERSTATETYPE state, DWORD value) {
+  return m_state->d3d->SetSamplerState(stage, state, value);
+}
+
+HRESULT D3D9Backend::clear(DWORD flags, D3DCOLOR color, float depth, DWORD stencil,
+    UINT count, const RECT* rects, bool computeRects) {
+  std::vector<D3DRECT> areas;
+  areas.reserve(count);
+  for (UINT i = 0; i < count; ++i)
+    areas.push_back({rects[i].left, rects[i].top, rects[i].right, rects[i].bottom});
+  return m_state->d3d->ClearNative(count, count ? areas.data() : nullptr,
+                                  flags, color, depth, stencil, computeRects);
+}
+
+static void copyRows(void* destination, UINT destinationPitch, const void* source,
+                     UINT sourcePitch, UINT bytes, UINT rows) {
+  auto dst = static_cast<uint8_t*>(destination);
+  auto src = static_cast<const uint8_t*>(source);
+  for (UINT row = 0; row < rows; ++row)
+    std::memcpy(dst + size_t(row) * destinationPitch, src + size_t(row) * sourcePitch, bytes);
+}
+
+HRESULT D3D9Backend::lockSurface(D3D9SurfaceResource& resource, const RECT* area,
+                               DWORD flags, D3DLOCKED_RECT& output) {
+  auto& state = *resource.m_state;
+  D3DLOCKED_RECT mapping = {};
+  const HRESULT hr = state.surface->LockRect(&mapping, area, flags);
+  if (FAILED(hr)) return hr;
+  state.mapping = mapping;
+  state.area = area ? *area : RECT{0, 0, LONG(state.desc.width), LONG(state.desc.height)};
+  state.locked = true;
+  state.readOnly = (flags & D3DLOCK_READONLY) != 0;
+  output = mapping;
+  if (state.desc.systemData) {
+    auto bytes = static_cast<uint8_t*>(state.desc.systemData);
+    output.pBits = bytes + size_t(state.area.top) * state.desc.systemPitch + size_t(state.area.left) * 4;
+    output.Pitch = INT(state.desc.systemPitch);
+  }
+  return S_OK;
+}
+
+HRESULT D3D9Backend::unlockSurface(D3D9SurfaceResource& resource, bool upload) {
+  auto& state = *resource.m_state;
+  if (upload && state.desc.systemData && !state.readOnly) {
+    auto bytes = static_cast<const uint8_t*>(state.desc.systemData)
+      + size_t(state.area.top) * state.desc.systemPitch + size_t(state.area.left) * 4;
+    copyRows(state.mapping.pBits, UINT(state.mapping.Pitch), bytes, state.desc.systemPitch,
+             UINT(state.area.right - state.area.left) * 4, UINT(state.area.bottom - state.area.top));
+  }
+  const HRESULT hr = state.surface->UnlockRect();
+  if (SUCCEEDED(hr)) state.locked = false;
+  return hr;
+}
+
+HRESULT D3D9Backend::readSurface(D3D9SurfaceResource& resource, std::vector<uint8_t>& output) {
+  auto& state = *resource.m_state;
+  const auto& desc = state.desc;
+  if (!desc.renderTarget || desc.depthStencil || desc.systemMemory || state.locked
+      || !desc.width || !desc.height || desc.width > UINT(INT_MAX / 4)
+      || uint64_t(desc.width) * desc.height * 4 > SIZE_MAX) return E_INVALIDARG;
+  if (!state.readback) {
+    Com<IDirect3DSurface9> readback;
+    const HRESULT hr = m_state->d3d->CreateOffscreenPlainSurface(desc.width, desc.height,
+      desc.format, D3DPOOL_SYSTEMMEM, &readback, nullptr);
+    if (hr != S_OK || !readback) return FAILED(hr) ? hr : E_FAIL;
+    state.readback = std::move(readback);
+  }
+  const HRESULT copied = m_state->d3d->GetRenderTargetData(state.surface.ptr(), state.readback.ptr());
+  if (copied != S_OK) return FAILED(copied) ? copied : E_FAIL;
+  // Allocate before locking; an allocation exception must not leave a map.
+  const UINT row = desc.width * 4;
+  std::vector<uint8_t> pixels(size_t(row) * desc.height);
+  D3DLOCKED_RECT map = {};
+  const HRESULT locked = state.readback->LockRect(&map, nullptr, D3DLOCK_READONLY);
+  if (FAILED(locked)) return locked;
+  HRESULT hr = locked == S_OK ? S_OK : E_FAIL;
+  const uint64_t extent = map.Pitch > 0 ? uint64_t(UINT(map.Pitch)) * (desc.height - 1) + row : 0;
+  if (hr == S_OK && (!map.pBits || map.Pitch < INT(row)
+      || extent > UINTPTR_MAX - reinterpret_cast<uintptr_t>(map.pBits))) hr = E_FAIL;
+  if (hr == S_OK) copyRows(pixels.data(), row, map.pBits, UINT(map.Pitch), row, desc.height);
+  const HRESULT unlocked = state.readback->UnlockRect();
+  if (unlocked != S_OK) return FAILED(unlocked) ? unlocked : E_FAIL;
+  if (hr == S_OK) output = std::move(pixels);
+  return hr;
+}
+
+HRESULT D3D9Backend::copySurface(D3D9SurfaceResource& destination, const RECT& destinationRect,
+                               D3D9SurfaceResource& source, const RECT& sourceRect,
+                               const D3D9SurfaceUpload* upload) {
+  auto& dst = *destination.m_state;
+  auto& src = *source.m_state;
+  if (src.desc.systemMemory && dst.desc.systemMemory)
+    return flush(); // The runtime performs the system-to-system copy itself.
+  if (src.desc.systemMemory) {
+    if (upload || src.desc.systemData) {
+      D3DLOCKED_RECT mapping = {};
+      HRESULT hr = src.surface->LockRect(&mapping, &sourceRect, 0);
+      if (FAILED(hr)) return hr;
+      const auto data = upload ? upload->data : static_cast<const uint8_t*>(src.desc.systemData)
+        + size_t(sourceRect.top) * src.desc.systemPitch + size_t(sourceRect.left) * 4;
+      const UINT pitch = upload ? upload->pitch : src.desc.systemPitch;
+      if (!mapping.pBits || mapping.Pitch <= 0) {
+        src.surface->UnlockRect();
+        return E_FAIL;
+      }
+      copyRows(mapping.pBits, UINT(mapping.Pitch), data, pitch,
+               UINT(sourceRect.right - sourceRect.left) * 4, UINT(sourceRect.bottom - sourceRect.top));
+      hr = src.surface->UnlockRect();
+      if (FAILED(hr)) return hr;
+    }
+    const POINT point = {destinationRect.left, destinationRect.top};
+    return m_state->d3d->UpdateSurface(src.surface.ptr(), &sourceRect, dst.surface.ptr(), &point);
+  }
+  if (!dst.desc.systemMemory && &destination == &source) {
+    if (!std::memcmp(&sourceRect, &destinationRect, sizeof(RECT))) return S_OK;
+    Com<IDirect3DSurface9> temporary;
+    HRESULT hr = m_state->d3d->CreateRenderTarget(UINT(sourceRect.right - sourceRect.left),
+      UINT(sourceRect.bottom - sourceRect.top), src.desc.format,
+      D3DMULTISAMPLE_NONE, 0, FALSE, &temporary, nullptr);
+    if (FAILED(hr)) return hr;
+    hr = m_state->d3d->StretchRect(src.surface.ptr(), &sourceRect, temporary.ptr(), nullptr, D3DTEXF_NONE);
+    if (FAILED(hr)) return hr;
+    return m_state->d3d->StretchRect(temporary.ptr(), nullptr, dst.surface.ptr(), &destinationRect, D3DTEXF_NONE);
+  }
+  if (!dst.desc.systemMemory)
+    return m_state->d3d->StretchRect(src.surface.ptr(), &sourceRect,
+                                    dst.surface.ptr(), &destinationRect, D3DTEXF_NONE);
+
+  // Read back the actual GPU surface before copying the requested region.
+  // This also handles caller-owned system memory with an arbitrary row pitch.
+  Com<IDirect3DSurface9> staging;
+  HRESULT hr = m_state->d3d->CreateOffscreenPlainSurface(src.desc.width, src.desc.height,
+    src.desc.format, D3DPOOL_SYSTEMMEM, &staging, nullptr);
+  if (FAILED(hr)) return hr;
+  hr = m_state->d3d->GetRenderTargetData(src.surface.ptr(), staging.ptr());
+  if (FAILED(hr)) return hr;
+  D3DLOCKED_RECT from = {}, to = {};
+  hr = staging->LockRect(&from, &sourceRect, D3DLOCK_READONLY);
+  if (FAILED(hr)) return hr;
+  hr = dst.surface->LockRect(&to, &destinationRect, 0);
+  if (SUCCEEDED(hr)) {
+    const UINT bytes = UINT(sourceRect.right - sourceRect.left) * 4;
+    const UINT rows = UINT(sourceRect.bottom - sourceRect.top);
+    copyRows(to.pBits, UINT(to.Pitch), from.pBits, UINT(from.Pitch), bytes, rows);
+    if (dst.desc.systemData) {
+      auto external = static_cast<uint8_t*>(dst.desc.systemData)
+        + size_t(destinationRect.top) * dst.desc.systemPitch + size_t(destinationRect.left) * 4;
+      copyRows(external, dst.desc.systemPitch, from.pBits, UINT(from.Pitch), bytes, rows);
+    }
+    hr = dst.surface->UnlockRect();
+  }
+  const HRESULT unlocked = staging->UnlockRect();
+  return FAILED(hr) ? hr : unlocked;
+}
+
+static HRESULT d3d9Error(HRESULT hr) {
+  switch (hr) {
+    case DXGI_ERROR_UNSUPPORTED:
+    case DXGI_ERROR_NOT_FOUND: return D3DERR_NOTAVAILABLE;
+    case DXGI_ERROR_DEVICE_REMOVED:
+    case DXGI_ERROR_DEVICE_RESET: return D3DERR_DEVICELOST;
+    default: return hr;
+  }
+}
+
+HRESULT D3D9Backend::create(const LUID& luid, std::unique_ptr<D3D9Backend>& result) noexcept {
+  result.reset();
+  try {
+    auto backend = std::make_unique<D3D9Backend>();
+    auto& state = *backend->m_state;
+    Rc<DxvkInstance> instance;
+    Rc<DxvkAdapter> adapter;
+    HRESULT hr = openRenderer(luid, DxvkInstanceFlag::ClientApiIsD3D9, instance, adapter);
+    if (FAILED(hr)) return d3d9Error(hr);
+    state.device = adapter->createDevice();
+    state.parent = new D3D9InterfaceEx(instance, adapter, true);
+    state.d3d = new D3D9DeviceEx(state.parent.ptr(), state.parent->GetAdapter(0),
+      D3DDEVTYPE_HAL, nullptr, D3DCREATE_HARDWARE_VERTEXPROCESSING
+      | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE, state.device);
+    hr = state.d3d->InitializeNativeOffscreen();
+    if (FAILED(hr)) return hr;
+    result = std::move(backend);
+    return S_OK;
+  } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    catch (const DxvkError& e) {
+      Logger::err(str::format("qcdx D3D9: ", e.message()));
+      return D3DERR_NOTAVAILABLE;
+    } catch (...) { return E_FAIL; }
+}
+
+}

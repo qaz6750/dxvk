@@ -4,7 +4,16 @@
 
 namespace dxvk::umd {
 
+inline bool isD3D10Interface(UINT version) noexcept {
+  return version == D3D10_0_DDI_INTERFACE_VERSION || version == D3D10_0_7_DDI_INTERFACE_VERSION;
+}
+
 inline bool supportedNativeInterface(UINT interfaceVersion, UINT version, UINT flags) noexcept {
+  if (isD3D10Interface(interfaceVersion)) {
+    const UINT build = interfaceVersion == D3D10_0_DDI_INTERFACE_VERSION
+        ? D3D10_0_DDI_BUILD_VERSION : D3D10_0_7_DDI_BUILD_VERSION;
+    return (version >> 16) >= build && flags == 0;
+  }
   UINT build;
   switch (interfaceVersion) {
     case D3D11_0_DDI_INTERFACE_VERSION: build = D3D11_0_DDI_BUILD_VERSION; break;

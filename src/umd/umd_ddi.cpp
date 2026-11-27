@@ -3,6 +3,7 @@
 #include "umd_adapter.h"
 #include "umd_shader.h"
 #include "umd_shader11.h"
+#include "umd_shader10_policy.h"
 #include "umd_query.h"
 #include "umd_predicate_wait.h"
 #include "umd_allocation.h"
@@ -71,8 +72,10 @@ struct Device {
   D3D10DDI_HRTCORELAYER runtime;
   // Both runtimes can update callback slots between calls. Keep the original
   // runtime-owned table and look up its error callback on the DDI caller.
+  const D3D10DDI_CORELAYER_DEVICECALLBACKS* callbacks10 = nullptr;
   const D3D11DDI_CORELAYER_DEVICECALLBACKS* callbacks11 = nullptr;
   D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_10_0;
+  bool nativeTable11 = false;
   D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
   dxvk::umd::RuntimeMemory memory;
   bool graphicsShadersReady = false;
@@ -141,7 +144,8 @@ struct Device {
   void error(HRESULT hr) {
     if (!FAILED(hr)) return;
     auto report = [&] {
-      const auto callback = callbacks11 ? callbacks11->pfnSetErrorCb : nullptr;
+      const auto callback = callbacks11 ? callbacks11->pfnSetErrorCb
+        : (callbacks10 ? callbacks10->pfnSetErrorCb : nullptr);
       if (callback) callback(runtime, dxvk::umd::ddiResult(hr));
       return S_OK;
     };
@@ -369,18 +373,9 @@ struct Shader : Child {
   std::optional<dxvk::umd::ShaderCode11> native11;
   dxvk::umd::ShaderStreamOutput11 nativeStream;
   std::vector<unsigned char> compiledNative11;
-  std::vector<unsigned char> compiledVertexBytecode;
   std::vector<unsigned char> passthroughSource;
-  std::vector<UINT> code;
-  std::vector<dxvk::umd::ShaderSignatureEntry> inputs;
-  std::vector<dxvk::umd::ShaderSignatureEntry> outputs;
-  std::array<dxvk::umd::ShaderScalar,32> compiledInputTypes = {};
-  std::array<dxvk::umd::ShaderScalar,32> compiledOutputTypes = {};
-  bool needsLayout = false;
-  bool needsLinkage = false;
   bool withStreamOutput = false;
   bool streamOutputPassthrough = false;
-  struct dxvk::umd::StreamOutput streamOutput;
 };
 struct InputLayout : Child {
   Device* owner = nullptr;
@@ -524,10 +519,12 @@ void APIENTRY createQuery(D3D10DDI_HDEVICE h, const D3D10DDIARG_CREATEQUERY* arg
     D3D10DDI_HQUERY out, D3D10DDI_HRTQUERY) {
   auto device = get(h);
   const HRESULT result = createRegisteredChild<Query>(device, queryStorage, out.pDrvPrivate, [&](Query& query) {
-    if (!args || !dxvk::umd::queryInfo11(args->Query, args->MiscFlags, query.info)) return E_INVALIDARG;
+    if (!args || !(device->nativeTable11
+        ? dxvk::umd::queryInfo11(args->Query, args->MiscFlags, query.info)
+        : dxvk::umd::queryInfo(args->Query, args->MiscFlags, query.info))) return E_INVALIDARG;
     D3D11_QUERY_DESC desc = {query.info.type,
       query.info.hint ? D3D11_QUERY_MISC_PREDICATEHINT : 0u};
-    if (device->featureLevel >= D3D_FEATURE_LEVEL_11_0
+    if (device->nativeTable11 && device->featureLevel >= D3D_FEATURE_LEVEL_11_0
         && args->Query == D3D10DDI_QUERY_STREAMOVERFLOWPREDICATE) {
       // DXVK's legacy overflow predicate observes only stream zero. Native
       // D3D11 defines it over every stream; aggregate four real BOOL queries.
@@ -780,6 +777,9 @@ HRESULT createSharedResource(Device* device, Resource* resource,
   return S_OK;
 }
 
+SIZE_T APIENTRY resourceSize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATERESOURCE*) {
+  return sizeof(Resource);
+}
 SIZE_T APIENTRY openedResourceSize(D3D10DDI_HDEVICE, const D3D10DDIARG_OPENRESOURCE*) {
   return sizeof(Resource);
 }
@@ -1019,6 +1019,14 @@ void publishNewResource(Device* device, D3D10DDI_HRESOURCE out, Build&& build, H
     if (!device->retired) device->error(hr);
   }
 }
+void APIENTRY createResource(D3D10DDI_HDEVICE h,
+    const D3D10DDIARG_CREATERESOURCE* args, D3D10DDI_HRESOURCE out,
+    D3D10DDI_HRTRESOURCE runtime) {
+  auto device = get(h);
+  publishNewResource(device, out, [&](Resource* staged) {
+    return createResourceData(device, args, staged, runtime);
+  });
+}
 void APIENTRY openResource(D3D10DDI_HDEVICE h, const D3D10DDIARG_OPENRESOURCE* args,
     D3D10DDI_HRESOURCE out, D3D10DDI_HRTRESOURCE runtime) {
   auto device = get(h);
@@ -1059,6 +1067,9 @@ void APIENTRY destroyResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE resource) {
   device->service->retire(retired.release());
 }
 
+SIZE_T APIENTRY shaderViewSize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATESHADERRESOURCEVIEW*) {
+  return sizeof(ShaderView);
+}
 // Translate the actual resource dimension, never reinterpret a DDI union.
 void APIENTRY createShaderView(D3D10DDI_HDEVICE h,
     const D3D10DDIARG_CREATESHADERRESOURCEVIEW* args,
@@ -1281,6 +1292,10 @@ void APIENTRY createTargetForInterface(D3D10DDI_HDEVICE h,
   }
   device->error(hr);
 }
+void APIENTRY createTarget(D3D10DDI_HDEVICE h, const D3D10DDIARG_CREATERENDERTARGETVIEW* args,
+    D3D10DDI_HRENDERTARGETVIEW out, D3D10DDI_HRTRENDERTARGETVIEW runtime) {
+  createTargetForInterface<false>(h, args, out, runtime);
+}
 void APIENTRY createTargetCubeArrays(D3D10DDI_HDEVICE h, const D3D10DDIARG_CREATERENDERTARGETVIEW* args,
     D3D10DDI_HRENDERTARGETVIEW out, D3D10DDI_HRTRENDERTARGETVIEW runtime) {
   createTargetForInterface<true>(h, args, out, runtime);
@@ -1297,6 +1312,9 @@ void APIENTRY clearTarget(D3D10DDI_HDEVICE h, D3D10DDI_HRENDERTARGETVIEW target,
   // A shared surface is one mip of one slice, so its view is the whole image
   // and this clear defines all of it. No refresh is owed.
   wroteSharedSurface(device, get(target)->shared);
+}
+SIZE_T APIENTRY depthViewSize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATEDEPTHSTENCILVIEW*) {
+  return sizeof(DepthView);
 }
 // Keep depth view creation atomic for each supported texture dimension.
 template<bool CubeArrays>
@@ -1347,6 +1365,10 @@ void APIENTRY createDepthViewForInterface(D3D10DDI_HDEVICE h,
     });
   }
   device->error(hr);
+}
+void APIENTRY createDepthView(D3D10DDI_HDEVICE h, const D3D10DDIARG_CREATEDEPTHSTENCILVIEW* args,
+    D3D10DDI_HDEPTHSTENCILVIEW out, D3D10DDI_HRTDEPTHSTENCILVIEW runtime) {
+  createDepthViewForInterface<false>(h, args, out, runtime);
 }
 void APIENTRY destroyDepthView(D3D10DDI_HDEVICE h, D3D10DDI_HDEPTHSTENCILVIEW object) {
   auto view = get(object);
@@ -1525,7 +1547,7 @@ void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstInd
       || !dxvk::umd::depthStencilRegionCopyContract(
           (source.bindings & D3D11_BIND_DEPTH_STENCIL) != 0,
           (destination.bindings & D3D11_BIND_DEPTH_STENCIL) != 0,
-          true,
+          device->nativeTable11 || device->featureLevel >= D3D_FEATURE_LEVEL_10_1,
           source.samples, destination.samples,
           input != nullptr, x, y, z, source.cube, destination.cube)
       || !dxvk::umd::sampleRegionCopyContract({source.width, source.height, source.samples, source.quality},
@@ -1689,6 +1711,124 @@ void APIENTRY unmapResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE resource, UIN
 SIZE_T APIENTRY shaderSize(D3D10DDI_HDEVICE, const UINT*, const D3D10DDIARG_STAGE_IO_SIGNATURES*) {
   return sizeof(Shader);
 }
+HRESULT createNativeShader10(Device* device, const UINT* code, D3D10DDI_HSHADER output,
+    dxvk::umd::ShaderStage stage, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature);
+void signatureOrdinals11(std::vector<dxvk::umd::ShaderIo11>& decoded,
+    const D3D10DDIARG_SIGNATURE_ENTRY* entries, UINT count);
+void createShader(D3D10DDI_HDEVICE h, const UINT* code, D3D10DDI_HSHADER out,
+    const D3D10DDIARG_STAGE_IO_SIGNATURES* signature, dxvk::umd::ShaderStage stage,
+    const D3D10DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT* streamOutput = nullptr) {
+  auto device = get(h);
+  if (!out.pDrvPrivate || uintptr_t(out.pDrvPrivate) % alignof(Shader)) {
+    device->error(E_INVALIDARG); return;
+  }
+  auto shader = new (out.pDrvPrivate) Shader();
+  shader->owner = device; shader->stage = stage;
+  if (!streamOutput) {
+    device->error(createNativeShader10(device, code, out, stage, signature));
+    return;
+  }
+  if (!code || !dxvk::umd::validLegacyShaderVersion(stage, code[0],
+        device->featureLevel >= D3D_FEATURE_LEVEL_10_1)
+      || !signature || signature->NumInputSignatureEntries > 32
+      || !signature->NumOutputSignatureEntries || signature->NumOutputSignatureEntries > 32
+      || !signature->pOutputSignature
+      || (signature->NumInputSignatureEntries && !signature->pInputSignature)) {
+    device->error(E_INVALIDARG); return;
+  }
+  try {
+    Shader candidate; candidate.owner = device; candidate.stage = stage;
+    candidate.retirement = std::make_unique<ComRetirement>();
+    dxvk::umd::StreamOutput declaration;
+    if (!dxvk::umd::streamOutputDeclaration(*streamOutput, *signature, declaration)) {
+      device->error(E_INVALIDARG); return;
+    }
+    dxvk::umd::ShaderCode11 decoded;
+    if (!dxvk::umd::decodeShader11(stage, code, code[1], decoded)
+        || !dxvk::umd::shader10Profile(decoded, device->featureLevel >= D3D_FEATURE_LEVEL_10_1)) {
+      device->error(E_INVALIDARG); return;
+    }
+    std::vector<dxvk::umd::ShaderInputSignature10> inputs;
+    for (UINT i = 0; i < signature->NumInputSignatureEntries; ++i) {
+      const auto& entry = signature->pInputSignature[i];
+      inputs.push_back({UINT(entry.SystemValue), entry.Register, entry.Mask});
+    }
+    if (!dxvk::umd::shader10GeometryInputs(decoded, inputs.data(), inputs.size())
+        || !dxvk::umd::shader10Profile(decoded, device->featureLevel >= D3D_FEATURE_LEVEL_10_1)) {
+      device->error(E_INVALIDARG); return;
+    }
+    signatureOrdinals11(decoded.inputs, signature->pInputSignature, signature->NumInputSignatureEntries);
+    signatureOrdinals11(decoded.outputs, signature->pOutputSignature, signature->NumOutputSignatureEntries);
+    candidate.withStreamOutput = true;
+    candidate.nativeStream.strides = declaration.strides;
+    candidate.nativeStream.strideCount = declaration.strideCount;
+    for (const auto& entry : declaration.entries)
+      candidate.nativeStream.entries.push_back({0, entry.SemanticIndex,
+        entry.SemanticName ? entry.SemanticName : "", entry.StartComponent, entry.ComponentCount, entry.OutputSlot});
+    candidate.native11 = std::move(decoded);
+    // Keep the original D3D10 SO object callable until its first draw. The
+    // shared preparation compiles its real declarations against the active
+    // producer, including data-only output with no rasterized position.
+    *shader = std::move(candidate);
+  } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
+    catch (...) { device->error(E_FAIL); }
+}
+void APIENTRY createVertexShader(D3D10DDI_HDEVICE h, const UINT* code,
+    D3D10DDI_HSHADER out, D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* sig) {
+  createShader(h, code, out, sig, dxvk::umd::ShaderStage::Vertex);
+}
+void APIENTRY createPixelShader(D3D10DDI_HDEVICE h, const UINT* code,
+    D3D10DDI_HSHADER out, D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* sig) {
+  createShader(h, code, out, sig, dxvk::umd::ShaderStage::Pixel);
+}
+void APIENTRY createGeometryShader(D3D10DDI_HDEVICE h, const UINT* code,
+    D3D10DDI_HSHADER out, D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* sig) {
+  createShader(h, code, out, sig, dxvk::umd::ShaderStage::Geometry);
+}
+SIZE_T APIENTRY geometryStreamSize(D3D10DDI_HDEVICE,
+    const D3D10DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT*, const D3D10DDIARG_STAGE_IO_SIGNATURES*) {
+  return sizeof(Shader);
+}
+void APIENTRY createGeometryStream(D3D10DDI_HDEVICE h,
+    const D3D10DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT* args,
+    D3D10DDI_HSHADER out, D3D10DDI_HRTSHADER,
+    const D3D10DDIARG_STAGE_IO_SIGNATURES* signature) {
+  if (!args) { get(h)->error(E_INVALIDARG); return; }
+  if (!args->pShaderCode) {
+    auto device = get(h);
+    if (!out.pDrvPrivate) { device->error(E_INVALIDARG); return; }
+    auto shader = new (out.pDrvPrivate) Shader();
+    shader->owner = device; shader->stage = dxvk::umd::ShaderStage::Geometry;
+    try {
+      Shader candidate;
+      candidate.owner = device; candidate.stage = dxvk::umd::ShaderStage::Geometry;
+      dxvk::umd::StreamOutput declaration;
+      std::vector<dxvk::umd::ShaderSignatureEntry> outputs;
+      if (!signature || !dxvk::umd::streamOutputPassthroughSignature(*signature, outputs)
+          || !dxvk::umd::streamOutputDeclaration(*args, *signature, declaration)) {
+        device->error(E_INVALIDARG); return;
+      }
+      // No GS code exists. The prior VS supplies the genuine compiled output
+      // signature when drawn; generic varyings retain their exact raw32 bits.
+      candidate.retirement = std::make_unique<ComRetirement>();
+      candidate.withStreamOutput = candidate.streamOutputPassthrough = true;
+      dxvk::umd::ShaderCode11 decoded;
+      for (const auto& entry : outputs)
+        decoded.outputs.push_back({entry.systemValue, entry.registerIndex, entry.mask, entry.scalar});
+      signatureOrdinals11(decoded.outputs, signature->pOutputSignature, signature->NumOutputSignatureEntries);
+      candidate.native11 = std::move(decoded);
+      candidate.nativeStream.strides = declaration.strides;
+      candidate.nativeStream.strideCount = declaration.strideCount;
+      for (const auto& entry : declaration.entries)
+        candidate.nativeStream.entries.push_back({0, entry.SemanticIndex,
+          entry.SemanticName ? entry.SemanticName : "", entry.StartComponent, entry.ComponentCount, entry.OutputSlot});
+      *shader = std::move(candidate);
+    } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
+      catch (...) { device->error(E_FAIL); }
+    return;
+  }
+  createShader(h, args->pShaderCode, out, signature, dxvk::umd::ShaderStage::Geometry, args);
+}
 void APIENTRY destroyShader(D3D10DDI_HDEVICE h, D3D10DDI_HSHADER shader) {
   auto object = get(shader);
   if (!object || object->owner != get(h)) { get(h)->error(E_INVALIDARG); return; }
@@ -1829,6 +1969,21 @@ HRESULT renderTargetBindings(Device* device, const D3D10DDI_HRENDERTARGETVIEW* t
   output.depth = depthView ? depthView->backend.Get() : nullptr; output.anyColor = anyColor;
   return S_OK;
 }
+void APIENTRY setRenderTargets(D3D10DDI_HDEVICE h,
+    const D3D10DDI_HRENDERTARGETVIEW* targets, UINT count, UINT clear,
+    D3D10DDI_HDEPTHSTENCILVIEW depth) {
+  auto device = get(h);
+  RenderTargetBindings bindings;
+  const HRESULT hr = renderTargetBindings(device, targets, count, clear, depth, bindings);
+  if (FAILED(hr)) { device->error(hr); return; }
+  try {
+    device->context->OMSetRenderTargets(count, count ? bindings.targets.data() : nullptr, bindings.depth);
+    device->targetShared = std::move(bindings.shared); device->targetBound = bindings.anyColor;
+    if (device->targetTypes != bindings.types) device->graphicsShadersReady = false;
+    device->targetTypes = bindings.types;
+  } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
+    catch (...) { device->error(E_FAIL); }
+}
 void APIENTRY setViewports(D3D10DDI_HDEVICE h, UINT count, UINT clear, const D3D10_DDI_VIEWPORT* views) {
   auto device = get(h);
   try {
@@ -1879,6 +2034,31 @@ void APIENTRY setRasterizer(D3D10DDI_HDEVICE h, D3D10DDI_HRASTERIZERSTATE state)
   auto object = get(state);
   if (object && (object->owner != device || !object->backend)) { device->error(E_INVALIDARG); return; }
   device->context->RSSetState(object ? object->backend.Get() : nullptr);
+}
+SIZE_T APIENTRY blendSize(D3D10DDI_HDEVICE, const D3D10_DDI_BLEND_DESC*) { return sizeof(BlendState); }
+void APIENTRY createBlend(D3D10DDI_HDEVICE h, const D3D10_DDI_BLEND_DESC* args,
+    D3D10DDI_HBLENDSTATE out, D3D10DDI_HRTBLENDSTATE) {
+  auto device = get(h);
+  if (!out.pDrvPrivate) { device->error(E_INVALIDARG); return; }
+  auto state = new (out.pDrvPrivate) BlendState(); state->owner = device;
+  if (!args) { device->error(E_INVALIDARG); return; }
+  D3D11_BLEND_DESC desc = {};
+  desc.AlphaToCoverageEnable = args->AlphaToCoverageEnable;
+  // Match DXVK's D3D10Device translation: enables and masks are per target,
+  // while factors/equations are shared by the D3D10.0 descriptor.
+  desc.IndependentBlendEnable = TRUE;
+  for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+    auto& target = desc.RenderTarget[i];
+    target.BlendEnable = args->BlendEnable[i];
+    target.RenderTargetWriteMask = args->RenderTargetWriteMask[i];
+    target.SrcBlend = static_cast<D3D11_BLEND>(args->SrcBlend);
+    target.DestBlend = static_cast<D3D11_BLEND>(args->DestBlend);
+    target.BlendOp = static_cast<D3D11_BLEND_OP>(args->BlendOp);
+    target.SrcBlendAlpha = static_cast<D3D11_BLEND>(args->SrcBlendAlpha);
+    target.DestBlendAlpha = static_cast<D3D11_BLEND>(args->DestBlendAlpha);
+    target.BlendOpAlpha = static_cast<D3D11_BLEND_OP>(args->BlendOpAlpha);
+  }
+  createChildBackend(device, state, [&] { return device->backend->CreateBlendState(&desc, &state->backend); });
 }
 void APIENTRY destroyBlend(D3D10DDI_HDEVICE h, D3D10DDI_HBLENDSTATE object) {
   auto state = get(object);
@@ -2063,34 +2243,25 @@ void APIENTRY setStreamTargets(D3D10DDI_HDEVICE h, UINT count, UINT clear,
   // D3D11 clears every higher slot; ClearTargets is only an optimization hint.
   device->context->SOSetTargets(count, buffers.data(), positions.data());
 }
-bool preparePassthroughGeometryShader(Device* device, const std::vector<unsigned char>& bytecode, bool bind = true) {
+bool preparePassthroughGeometryShader(Device* device, const std::vector<unsigned char>& bytecode) {
   auto shader = device->geometryShader;
   if (!shader || !shader->streamOutputPassthrough || bytecode.empty()) {
     device->error(E_INVALIDARG); return false;
   }
   if (!shader->geometry || shader->passthroughSource != bytecode) {
     ComPtr<ID3D11GeometryShader> compiled;
-    HRESULT hr;
-    if (shader->native11) {
-      const auto& stream = shader->nativeStream;
-      std::vector<D3D11_SO_DECLARATION_ENTRY> entries;
-      for (const auto& entry : stream.entries)
-        entries.push_back({entry.stream, entry.semantic.empty() ? nullptr : entry.semantic.c_str(),
-          entry.semanticIndex, entry.start, entry.count, entry.slot});
-      hr = device->backend->CreateGeometryShaderWithStreamOutput(bytecode.data(), bytecode.size(),
-        entries.empty() ? nullptr : entries.data(), UINT(entries.size()), stream.strides.data(), stream.strideCount,
-        stream.rasterizedStream, nullptr, &compiled);
-    } else {
-      const auto& stream = shader->streamOutput;
-      hr = device->backend->CreateGeometryShaderWithStreamOutput(bytecode.data(), bytecode.size(),
-        stream.entries.data(), UINT(stream.entries.size()), stream.strides.data(), stream.strideCount,
-        D3D11_SO_NO_RASTERIZED_STREAM, nullptr, &compiled);
-    }
+    const auto& stream = shader->nativeStream;
+    std::vector<D3D11_SO_DECLARATION_ENTRY> entries;
+    for (const auto& entry : stream.entries)
+      entries.push_back({entry.stream, entry.semantic.empty() ? nullptr : entry.semantic.c_str(),
+        entry.semanticIndex, entry.start, entry.count, entry.slot});
+    HRESULT hr = device->backend->CreateGeometryShaderWithStreamOutput(bytecode.data(), bytecode.size(),
+      entries.empty() ? nullptr : entries.data(), UINT(entries.size()), stream.strides.data(), stream.strideCount,
+      stream.rasterizedStream, nullptr, &compiled);
     if (hr != S_OK || !compiled) { device->error(FAILED(hr) ? hr : E_FAIL); return false; }
     shader->passthroughSource = bytecode;
     shader->geometry = std::move(compiled);
   }
-  if (bind) device->context->GSSetShader(shader->geometry.Get(), nullptr, 0);
   return true;
 }
 void APIENTRY setIndexBuffer(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE object, DXGI_FORMAT format, UINT offset) {
@@ -2193,6 +2364,11 @@ void APIENTRY flush(D3D10DDI_HDEVICE h) {
     device->error(DXGI_ERROR_DEVICE_REMOVED);
   // Anything another process wrote before this point must be read again.
   openSharedEpoch(device);
+}
+void APIENTRY relocateDeviceFunctions(D3D10DDI_HDEVICE h, D3D10DDI_DEVICEFUNCS* functions) {
+  if (!functions) { get(h)->error(E_INVALIDARG); return; }
+  // The runtime has already copied its table. No driver object caches a
+  // pointer to that table, and none of our entrypoints require rebasing.
 }
 void APIENTRY counterInfo(D3D10DDI_HDEVICE h, D3D10DDI_COUNTER_INFO* info) {
   if (!info) { get(h)->error(E_INVALIDARG); return; }
@@ -2906,7 +3082,8 @@ namespace {
 #include "umd_d3d11_ddi.inl"
 #include "umd_d3d11_shader.inl"
 
-void populateDeviceFunctions(D3D11DDI_DEVICEFUNCS* table) {
+template<typename Table>
+void populateDeviceFunctions(Table* table) {
   *table = {};
   table->pfnDestroyResource = deviceEntry<destroyResource>;
   table->pfnCalcPrivateOpenedResourceSize = deviceEntry<openedResourceSize>;
@@ -2991,72 +3168,95 @@ void populateDeviceFunctions(D3D11DDI_DEVICEFUNCS* table) {
   table->pfnCheckCounter = deviceEntry<checkCounter>;
   table->pfnSetTextFilterSize = deviceEntry<setTextFilterSize>;
   table->pfnDestroyDevice = destroyDevice;
-  table->pfnCreateRenderTargetView = deviceEntry<createTargetCubeArrays>;
-  table->pfnCalcPrivateBlendStateSize = deviceEntry<blendSize10_1>;
-  table->pfnCreateBlendState = deviceEntry<createBlend10_1>;
-  table->pfnResourceConvert = deviceEntry<convertResource, true>;
-  table->pfnResourceConvertRegion = deviceEntry<convertResourceRegion, true>;
-  table->pfnCalcPrivateResourceSize = deviceEntry<resourceSize11>;
-  table->pfnCreateVertexShader = deviceEntry<createVertexShader11>;
-  table->pfnCreatePixelShader = deviceEntry<createPixelShader11>;
-  table->pfnCreateGeometryShader = deviceEntry<createGeometryShader11>;
-  table->pfnVsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Vertex>>;
-  table->pfnPsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Pixel>>;
-  table->pfnGsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Geometry>>;
-  table->pfnIaSetTopology = deviceEntry<setTopology11>;
-  table->pfnCreateResource = deviceEntry<createResource11>;
-  table->pfnCalcPrivateShaderResourceViewSize = deviceEntry<shaderViewSize11>;
-  table->pfnCreateShaderResourceView = deviceEntry<createShaderView11>;
-  table->pfnCalcPrivateDepthStencilViewSize = deviceEntry<depthViewSize11>;
-  table->pfnCreateDepthStencilView = deviceEntry<createDepthView11>;
-  table->pfnCalcPrivateGeometryShaderWithStreamOutput = deviceEntry<geometryStreamSize11>;
-  table->pfnCreateGeometryShaderWithStreamOutput = deviceEntry<createGeometryStream11>;
-  table->pfnSetRenderTargets = deviceEntry<setRenderTargets11>;
-  table->pfnRelocateDeviceFuncs = deviceEntry<relocateDeviceFunctions11>;
-  table->pfnDrawInstancedIndirect = deviceEntry<drawInstancedIndirect, true>;
-  table->pfnDrawIndexedInstancedIndirect = deviceEntry<drawIndexedInstancedIndirect, true>;
-  table->pfnHsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Hull>>;
-  table->pfnDsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Domain>>;
-  table->pfnCsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Compute>>;
-  table->pfnHsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Hull>>;
-  table->pfnDsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Domain>>;
-  table->pfnCsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Compute>>;
-  table->pfnHsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Hull>>;
-  table->pfnDsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Domain>>;
-  table->pfnCsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Compute>>;
-  table->pfnHsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Hull>>;
-  table->pfnDsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Domain>>;
-  table->pfnCsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Compute>>;
-  table->pfnCreateHullShader = deviceEntry<createHullShader11>;
-  table->pfnCreateDomainShader = deviceEntry<createDomainShader11>;
-  table->pfnCalcPrivateTessellationShaderSize = deviceEntry<tessellationSize>;
-  table->pfnPsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Pixel>>;
-  table->pfnVsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Vertex>>;
-  table->pfnGsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Geometry>>;
-  table->pfnHsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Hull>>;
-  table->pfnDsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Domain>>;
-  table->pfnCsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Compute>>;
-  table->pfnCreateComputeShader = deviceEntry<createComputeShader11>;
-  table->pfnCalcPrivateUnorderedAccessViewSize = deviceEntry<unorderedViewSize>;
-  table->pfnCreateUnorderedAccessView = deviceEntry<createUnorderedView>;
-  table->pfnDestroyUnorderedAccessView = deviceEntry<destroyUnorderedView>;
-  table->pfnClearUnorderedAccessViewUint = deviceEntry<clearUnorderedUint, true>;
-  table->pfnClearUnorderedAccessViewFloat = deviceEntry<clearUnorderedFloat, true>;
-  table->pfnCsSetUnorderedAccessViews = deviceEntry<setUnorderedViews>;
-  table->pfnDispatch = deviceEntry<dispatch, true>;
-  table->pfnDispatchIndirect = deviceEntry<dispatchIndirect, true>;
-  table->pfnCopyStructureCount = deviceEntry<copyStructureCount, true>;
-  table->pfnSetResourceMinLOD = deviceEntry<setResourceMinLod>;
-  // Command lists remain NULL: the adapter advertises no command-list
-  // capability. This is the SDK optional-slot contract, not a stub success.
+  if constexpr (std::is_same_v<Table, D3D10DDI_DEVICEFUNCS>) {
+    table->pfnCreateVertexShader = deviceEntry<createVertexShader>;
+    table->pfnCreatePixelShader = deviceEntry<createPixelShader>;
+    table->pfnCreateGeometryShader = deviceEntry<createGeometryShader>;
+    table->pfnVsSetShader = deviceEntry<setShader10<dxvk::umd::ShaderStage::Vertex>>;
+    table->pfnPsSetShader = deviceEntry<setShader10<dxvk::umd::ShaderStage::Pixel>>;
+    table->pfnGsSetShader = deviceEntry<setShader10<dxvk::umd::ShaderStage::Geometry>>;
+    table->pfnIaSetTopology = deviceEntry<setTopology11>;
+    table->pfnCreateRenderTargetView = deviceEntry<createTarget>;
+    table->pfnCalcPrivateResourceSize = deviceEntry<resourceSize>;
+    table->pfnCreateResource = deviceEntry<createResource>;
+    table->pfnCalcPrivateShaderResourceViewSize = deviceEntry<shaderViewSize>;
+    table->pfnCreateShaderResourceView = deviceEntry<createShaderView>;
+    table->pfnCalcPrivateDepthStencilViewSize = deviceEntry<depthViewSize>;
+    table->pfnCreateDepthStencilView = deviceEntry<createDepthView>;
+    table->pfnCalcPrivateGeometryShaderWithStreamOutput = deviceEntry<geometryStreamSize>;
+    table->pfnCreateGeometryShaderWithStreamOutput = deviceEntry<createGeometryStream>;
+    table->pfnSetRenderTargets = deviceEntry<setRenderTargets>;
+    table->pfnCalcPrivateBlendStateSize = deviceEntry<blendSize>;
+    table->pfnCreateBlendState = deviceEntry<createBlend>;
+    table->pfnRelocateDeviceFuncs = deviceEntry<relocateDeviceFunctions>;
+  } else {
+    table->pfnCreateRenderTargetView = deviceEntry<createTargetCubeArrays>;
+    table->pfnCalcPrivateBlendStateSize = deviceEntry<blendSize10_1>;
+    table->pfnCreateBlendState = deviceEntry<createBlend10_1>;
+    table->pfnResourceConvert = deviceEntry<convertResource, true>;
+    table->pfnResourceConvertRegion = deviceEntry<convertResourceRegion, true>;
+    table->pfnCalcPrivateResourceSize = deviceEntry<resourceSize11>;
+    table->pfnCreateVertexShader = deviceEntry<createVertexShader11>;
+    table->pfnCreatePixelShader = deviceEntry<createPixelShader11>;
+    table->pfnCreateGeometryShader = deviceEntry<createGeometryShader11>;
+    table->pfnVsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Vertex>>;
+    table->pfnPsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Pixel>>;
+    table->pfnGsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Geometry>>;
+    table->pfnIaSetTopology = deviceEntry<setTopology11>;
+    table->pfnCreateResource = deviceEntry<createResource11>;
+    table->pfnCalcPrivateShaderResourceViewSize = deviceEntry<shaderViewSize11>;
+    table->pfnCreateShaderResourceView = deviceEntry<createShaderView11>;
+    table->pfnCalcPrivateDepthStencilViewSize = deviceEntry<depthViewSize11>;
+    table->pfnCreateDepthStencilView = deviceEntry<createDepthView11>;
+    table->pfnCalcPrivateGeometryShaderWithStreamOutput = deviceEntry<geometryStreamSize11>;
+    table->pfnCreateGeometryShaderWithStreamOutput = deviceEntry<createGeometryStream11>;
+    table->pfnSetRenderTargets = deviceEntry<setRenderTargets11>;
+    table->pfnRelocateDeviceFuncs = deviceEntry<relocateDeviceFunctions11>;
+    table->pfnDrawInstancedIndirect = deviceEntry<drawInstancedIndirect, true>;
+    table->pfnDrawIndexedInstancedIndirect = deviceEntry<drawIndexedInstancedIndirect, true>;
+    table->pfnHsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Hull>>;
+    table->pfnDsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Domain>>;
+    table->pfnCsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Compute>>;
+    table->pfnHsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Hull>>;
+    table->pfnDsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Domain>>;
+    table->pfnCsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Compute>>;
+    table->pfnHsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Hull>>;
+    table->pfnDsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Domain>>;
+    table->pfnCsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Compute>>;
+    table->pfnHsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Hull>>;
+    table->pfnDsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Domain>>;
+    table->pfnCsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Compute>>;
+    table->pfnCreateHullShader = deviceEntry<createHullShader11>;
+    table->pfnCreateDomainShader = deviceEntry<createDomainShader11>;
+    table->pfnCalcPrivateTessellationShaderSize = deviceEntry<tessellationSize>;
+    table->pfnPsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Pixel>>;
+    table->pfnVsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Vertex>>;
+    table->pfnGsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Geometry>>;
+    table->pfnHsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Hull>>;
+    table->pfnDsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Domain>>;
+    table->pfnCsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Compute>>;
+    table->pfnCreateComputeShader = deviceEntry<createComputeShader11>;
+    table->pfnCalcPrivateUnorderedAccessViewSize = deviceEntry<unorderedViewSize>;
+    table->pfnCreateUnorderedAccessView = deviceEntry<createUnorderedView>;
+    table->pfnDestroyUnorderedAccessView = deviceEntry<destroyUnorderedView>;
+    table->pfnClearUnorderedAccessViewUint = deviceEntry<clearUnorderedUint, true>;
+    table->pfnClearUnorderedAccessViewFloat = deviceEntry<clearUnorderedFloat, true>;
+    table->pfnCsSetUnorderedAccessViews = deviceEntry<setUnorderedViews>;
+    table->pfnDispatch = deviceEntry<dispatch, true>;
+    table->pfnDispatchIndirect = deviceEntry<dispatchIndirect, true>;
+    table->pfnCopyStructureCount = deviceEntry<copyStructureCount, true>;
+    table->pfnSetResourceMinLOD = deviceEntry<setResourceMinLod>;
+    // Command lists remain NULL: the adapter advertises no command-list
+    // capability. This is the SDK optional-slot contract, not a stub success.
+  }
 }
 
-HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native) {
+template<typename Table, typename Callbacks>
+HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native, Table* table, Callbacks* callbacks) {
   const auto h = native->hDrvDevice;
-  const auto callbacks11 = native->p11UMCallbacks;
-  const auto table = native->p11DeviceFuncs;
+  constexpr bool isD3D11 = std::is_same_v<Table, D3D11DDI_DEVICEFUNCS>;
   if (!h.pDrvPrivate || uintptr_t(h.pDrvPrivate) % alignof(DevicePrivate)
-      || !callbacks11 || !callbacks11->pfnSetErrorCb || !table
+      || !callbacks || !callbacks->pfnSetErrorCb || !table
       || !native->hRTCoreLayer.handle) return E_INVALIDARG;
   auto owner = std::make_shared<Device>();
   dxvk::umd::RuntimeService::Scope scope(owner->service.get());
@@ -3074,7 +3274,9 @@ HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native) {
   } guard{h.pDrvPrivate, owner};
   auto device = owner.get();
   device->runtime = native->hRTCoreLayer;
-  device->callbacks11 = callbacks11;
+  device->nativeTable11 = isD3D11;
+  if constexpr (isD3D11) device->callbacks11 = callbacks;
+  else device->callbacks10 = callbacks;
   device->memory.initialize(native->hRTDevice.handle, *native->pKTCallbacks,
     native->DXGIBaseDDI.pDXGIBaseCallbacks);
   const bool dxgi11 = dxvk::umd::nativeDxgiUses1_1(native->Interface, native->Version);
@@ -3086,7 +3288,7 @@ HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native) {
   });
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
   if (!device->backend || !device->context) return E_FAIL;
-  if (callbacks11) {
+  if constexpr (isD3D11) {
     // Backend construction can submit its own initialization buffers before
     // any DDI device/immediate context exists. Install the runtime opportunity
     // only after construction succeeds, before publishing callable entries.
@@ -3136,5 +3338,7 @@ HRESULT dxvk::umd::createAdapterDevice(
   if (!identity || !args) return E_INVALIDARG;
   if (!supportedNativeInterface(args->Interface, args->Version, args->Flags)) return DXGI_ERROR_UNSUPPORTED;
   if (!args->pKTCallbacks || !args->hRTDevice.handle) return E_INVALIDARG;
-  return createDdiDevice(identity->luid, args);
+  if (isD3D10Interface(args->Interface))
+    return createDdiDevice(identity->luid, args, args->pDeviceFuncs, args->pUMCallbacks);
+  return createDdiDevice(identity->luid, args, args->p11DeviceFuncs, args->p11UMCallbacks);
 }

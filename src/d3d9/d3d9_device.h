@@ -1101,6 +1101,32 @@ namespace dxvk {
 
     uint32_t GetHeadCount() const;
 
+    HRESULT InitializeNativeOffscreen();
+    HRESULT SetNativeWInfo(float wNear, float wFar);
+
+    // The native DDI can unbind RT0. The public D3D9 API keeps its non-null
+    // RT0 contract; native resources still require this device's ownership.
+    HRESULT SetNativeRenderTarget(IDirect3DSurface9* target);
+
+    // A preclipped native clear must not apply viewport/scissor clipping again.
+    HRESULT ClearNative(DWORD count, const D3DRECT* rects, DWORD flags,
+                        D3DCOLOR color, float depth, DWORD stencil, bool computeRects);
+
+    // Native DDI shader code has an explicit byte count. Preserve that bound
+    // through analysis and compilation instead of walking a public API pointer.
+    HRESULT CreateNativeVertexShader(const DWORD* code, UINT bytes, IDirect3DVertexShader9** shader);
+    HRESULT CreateNativePixelShader(const DWORD* code, UINT bytes, IDirect3DPixelShader9** shader);
+
+    // Native owned buffer copies also keep the CPU mapping coherent. A caller
+    // upload is already snapshotted before the runtime callback pump starts.
+    bool IsNativeRenderer() const noexcept;
+
+    HRESULT CopyNativeBuffer(D3D9CommonBuffer* destination, UINT destinationOffset,
+                             D3D9CommonBuffer* source, UINT sourceOffset, UINT bytes,
+                             const void* upload);
+
+    HRESULT FlushRuntimeSubmission();
+
     /**
      * \brief Returns the allocator used for unmappable system memory texture data
      */
@@ -1224,6 +1250,9 @@ namespace dxvk {
 
   private:
 
+    HRESULT ClearInternal(DWORD count, const D3DRECT* rects, DWORD flags,
+                          D3DCOLOR color, float depth, DWORD stencil, bool preclipped);
+
     template<bool AllowFlush = true, typename Cmd>
     void EmitCs(Cmd&& command) {
       if (unlikely(m_csDataType != D3D9CmdType::None)) {
@@ -1305,7 +1334,8 @@ namespace dxvk {
             D3D9CommonShader*     pShaderModule,
             size_t*               pLength,
             D3D9ShaderType        ShaderType,
-      const DWORD*                pShaderBytecode);
+      const DWORD*                pShaderBytecode,
+            size_t                bytecodeSize = size_t(-1));
 
     inline uint32_t GetUPDataSize(uint32_t vertexCount, uint32_t stride) {
       return vertexCount * stride;
@@ -1617,6 +1647,8 @@ namespace dxvk {
     D3D9Multithread                 m_multithread;
     D3D9InputAssemblyState          m_iaState;
 
+    bool                            m_nativeWInfoValid = false;
+    bool                            m_nativeFogUseZ = false;
     D3D9DeviceDirtyFlags            m_dirty;
 
     D3D9TextureSlotTracking         m_textureSlotTracking;

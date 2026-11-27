@@ -1,4 +1,5 @@
 #include "umd_allocation.h"
+#include "umd_api.h"
 #include "umd_residency_transaction.h"
 #include <cstring>
 #include <utility>
@@ -18,9 +19,8 @@ DXGI_FORMAT allocationFormat(const qcdx_alloc& a) {
     default: return DXGI_FORMAT_UNKNOWN;
   }
 }
-static UINT rowBytes(const qcdx_alloc& a) {
-  return a.width * (a.format == 113 ? 8u : 4u);
-}
+static UINT pixelBytes(const qcdx_alloc& a) { return a.format == 113 ? 8u : 4u; }
+static UINT rowBytes(const qcdx_alloc& a) { return a.width * pixelBytes(a); }
 static bool validSurface(const qcdx_alloc& a) {
   constexpr auto knownFlags = QCDX_ALLOC_F_DIRECT | QCDX_ALLOC_F_PRIMARY | QCDX_ALLOC_F_SRGB;
   return a.magic == QCDX_ALLOC_MAGIC && !a.bo && !a.bo_offset && !(a.flags & ~knownFlags)
@@ -41,6 +41,7 @@ bool RuntimeAllocation::canRotateWith(const RuntimeAllocation& other) const {
   const auto& b = other.surface->layout;
   return surface->owner && surface->owner == other.surface->owner && surface->handle &&
       other.surface->handle && !surface->locked && !other.surface->locked &&
+      !surface->pendingLock && !other.surface->pendingLock &&
       a.width == b.width && a.height == b.height && a.format == b.format;
 }
 void RuntimeAllocation::swapIdentity(RuntimeAllocation& other) {
@@ -155,11 +156,13 @@ HRESULT RuntimeMemory::release(const std::shared_ptr<VidmmSurface>& binding) {
   }
   return hr;
 }
-HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, void* data, UINT pitch, bool publish) {
+template<typename GetPixels>
+HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region, SharedReadGuard guard, GetPixels getPixels) {
   auto binding = out.surface;
-  if (!available() || !binding || binding->owner != this || !data || !binding->handle ||
-      pitch < rowBytes(binding->layout)) return E_INVALIDARG;
+  if (!available() || !binding || binding->owner != this || !binding->handle) return E_INVALIDARG;
   if (binding->locked || binding->pendingLock) return DXGI_ERROR_WAS_STILL_DRAWING;
+  region.bounds = out.clip(region.bounds);
+  if (region.keep.contains(region.bounds)) return S_OK;
   D3DDDICB_LOCK2 map = {};
   map.hAllocation = binding->handle;
   binding->pendingLock = &map;
@@ -168,22 +171,23 @@ HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, void* data, UINT pitch, 
   if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
   if (FAILED(hr)) return hr;
   binding->locked = true;
-  if (map.pData && hr == S_OK) {
-    auto host = static_cast<unsigned char*>(data);
-    auto vidmm = static_cast<unsigned char*>(map.pData);
+  // Lock2 may reenter the DDI. Synchronize the renderable image only once
+  // the runtime has returned and consume its pixels before calling Unlock2.
+  D3D11_MAPPED_SUBRESOURCE pixels = {};
+  hr = (map.pData && hr == S_OK) ? getPixels(pixels) : E_FAIL;
+  if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr == S_OK && !guard.current()) hr = DXGI_ERROR_WAS_STILL_DRAWING;
+  if (hr == S_OK && (!pixels.pData || pixels.RowPitch < rowBytes(binding->layout)))
+    hr = E_INVALIDARG;
+  if (hr == S_OK) {
     const auto& layout = binding->layout;
-    const auto bytes = rowBytes(layout);
-    auto src = publish ? host : vidmm;
-    auto dst = publish ? vidmm : host;
-    if (pitch == bytes && layout.pitch == bytes) {
-      std::memcpy(dst, src, size_t(bytes) * layout.height);
-    } else {
-      const auto srcPitch = publish ? pitch : layout.pitch;
-      const auto dstPitch = publish ? layout.pitch : pitch;
-      for (UINT y = 0; y < layout.height; ++y)
-        std::memcpy(dst + size_t(y) * dstPitch, src + size_t(y) * srcPitch, bytes);
-    }
-  } else hr = E_FAIL;
+    region.forEach([&](SurfaceRect area) {
+      if (publish)
+        copySurfaceRect(map.pData, layout.pitch, pixels.pData, pixels.RowPitch, pixelBytes(layout), area);
+      else
+        copySurfaceRect(pixels.pData, pixels.RowPitch, map.pData, layout.pitch, pixelBytes(layout), area);
+    });
+  }
   D3DDDICB_UNLOCK2 unlock = {};
   unlock.hAllocation = binding->handle;
   binding->locked = false;
@@ -191,11 +195,25 @@ HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, void* data, UINT pitch, 
   if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
   return FAILED(result) ? result : hr;
 }
-HRESULT RuntimeMemory::upload(RuntimeAllocation& out, const void* data, UINT pitch) {
-  return transfer(out, const_cast<void*>(data), pitch, true);
+HRESULT RuntimeMemory::upload(RuntimeAllocation& out, const void* data, UINT pitch, SurfaceRect area) {
+  if (!data || !out.surface || pitch < rowBytes(out.surface->layout)) return E_INVALIDARG;
+  return transfer(out, true, {area, {}}, {}, [&](D3D11_MAPPED_SUBRESOURCE& pixels) {
+    pixels = {const_cast<void*>(data), pitch, 0};
+    return S_OK;
+  });
 }
-HRESULT RuntimeMemory::download(RuntimeAllocation& out, void* data, UINT pitch) {
-  return transfer(out, data, pitch, false);
+HRESULT RuntimeMemory::download(RuntimeAllocation& out, void* data, UINT pitch, SurfaceTransfer region, SharedReadGuard guard) {
+  if (!data || !out.surface || pitch < rowBytes(out.surface->layout)) return E_INVALIDARG;
+  return transfer(out, false, region, guard, [&](D3D11_MAPPED_SUBRESOURCE& pixels) {
+    pixels = {data, pitch, 0};
+    return S_OK;
+  });
+}
+HRESULT RuntimeMemory::transferImage(RuntimeAllocation& out, ID3D11DeviceContext* context,
+                                    ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard) {
+  return transfer(out, publish, region, guard, [&](D3D11_MAPPED_SUBRESOURCE& pixels) {
+    return getSharedImageMapping(context, image, publish, &pixels);
+  });
 }
 HRESULT RuntimeMemory::setDisplayMode(RuntimeAllocation& out, const Live& live) {
   if (!available() || !live()) return DXGI_ERROR_DEVICE_REMOVED;

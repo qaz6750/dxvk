@@ -1,5 +1,7 @@
 #pragma once
 #include "umd_ddi.h"
+#include "umd_shared_policy.h"
+#include <d3d11.h>
 #include "qcdx_escape.h"
 #include <functional>
 #include <memory>
@@ -32,6 +34,9 @@ public:
   void completeOpen(HANDLE resource) { surface->resource = resource; }
   D3DKMT_HANDLE handle() const { return surface ? surface->handle : 0; }
   bool primary() const { return surface && primaryAllocation(surface->layout); }
+  SurfaceRect clip(SurfaceRect area) const {
+    return surface ? area.clipped(surface->layout.width, surface->layout.height) : SurfaceRect{};
+  }
   bool canRotateWith(const RuntimeAllocation& other) const;
   void swapIdentity(RuntimeAllocation& other);
 private:
@@ -49,8 +54,10 @@ public:
   HRESULT allocate(RuntimeAllocation& out, HANDLE resource, UINT width, UINT height,
                    DXGI_FORMAT format, bool primary = false);
   HRESULT adopt(RuntimeAllocation& out, D3DKMT_HANDLE allocation, const qcdx_alloc& layout);
-  HRESULT upload(RuntimeAllocation& out, const void* data, UINT pitch);
-  HRESULT download(RuntimeAllocation& out, void* data, UINT pitch);
+  HRESULT upload(RuntimeAllocation& out, const void* data, UINT pitch, SurfaceRect area = SurfaceRect::full());
+  HRESULT download(RuntimeAllocation& out, void* data, UINT pitch, SurfaceTransfer region, SharedReadGuard guard);
+  HRESULT transferImage(RuntimeAllocation& out, ID3D11DeviceContext* context,
+                        ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard);
   HRESULT setDisplayMode(RuntimeAllocation& primary, const Live& live);
   HRESULT present(RuntimeAllocation& source, const DXGI_DDI_ARG_PRESENT& args,
                   const Live& live, D3DKMT_HANDLE destination);
@@ -62,7 +69,8 @@ public:
 private:
   friend class RuntimeAllocation;
   HRESULT ensureContext(const Live& live);
-  HRESULT transfer(RuntimeAllocation& out, void* data, UINT pitch, bool upload);
+  template<typename GetPixels>
+  HRESULT transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region, SharedReadGuard guard, GetPixels getPixels);
   HRESULT release(const std::shared_ptr<VidmmSurface>& surface);
   HANDLE device = nullptr, context = nullptr;
   D3DDDI_DEVICECALLBACKS callbacks = {};

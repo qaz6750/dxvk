@@ -50,6 +50,7 @@
 
 namespace {
 using Microsoft::WRL::ComPtr;
+using dxvk::umd::SurfaceRect;
 struct Shader;
 struct InputLayout;
 struct Device;
@@ -83,6 +84,8 @@ struct Device {
   bool pixelBound = false;
   bool targetBound = false;
   bool viewportBound = false;
+  bool scissorEnabled = false;
+  SurfaceRect scissorBounds;
   bool topologyBound = false;
   bool indexBound = false;
   Shader* vertexShader = nullptr;
@@ -716,10 +719,11 @@ void openSharedEpoch(Device* device) {
 
 // Make a bound surface's cache current for this epoch before the pipeline
 // reads it. Reports through SetError and answers whether the draw may run.
-bool readSharedSurface(Device* device, const std::shared_ptr<dxvk::umd::SharedSurface>& surface) {
+bool readSharedSurface(Device* device, const std::shared_ptr<dxvk::umd::SharedSurface>& surface,
+    SurfaceRect area = SurfaceRect::full()) {
   if (!surface) return true;
   const HRESULT hr = dxvk::umd::refreshSharedSurface(device->backend.Get(),
-    device->context.Get(), device->memory, *surface, device->sharedEpoch);
+    device->context.Get(), device->memory, *surface, device->sharedEpoch, area);
   if (FAILED(hr)) { device->error(hr); return false; }
   return true;
 }
@@ -734,10 +738,11 @@ void wroteSharedSurface(Device* device, const std::shared_ptr<dxvk::umd::SharedS
 
 // A write that leaves some pixels as the owning process last left them, so the
 // cache has to hold those before it can be published back.
-bool wroteSharedRegion(Device* device, const std::shared_ptr<dxvk::umd::SharedSurface>& surface) {
+bool wroteSharedRegion(Device* device, const std::shared_ptr<dxvk::umd::SharedSurface>& surface,
+    SurfaceRect area) {
   if (!surface) return true;
-  if (!readSharedSurface(device, surface)) return false;
-  dxvk::umd::sharedWroteRegion(surface->state);
+  if (!readSharedSurface(device, surface, area)) return false;
+  dxvk::umd::sharedWroteRegion(surface->state, area);
   return true;
 }
 
@@ -821,7 +826,7 @@ HRESULT openResourceData(Device* device, const D3D10DDIARG_OPENRESOURCE* args,
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    hr = device->backend->CreateTexture2D(&desc, nullptr, &surface->cache);
+    hr = dxvk::umd::createSharedTexture(device->backend.Get(), desc, nullptr, &surface->cache);
     if (FAILED(hr)) return hr;
     resource->backend = surface->cache;
     resource->nativeBindFlags = D3D10_DDI_BIND_SHADER_RESOURCE | D3D10_DDI_BIND_RENDER_TARGET;
@@ -939,7 +944,10 @@ HRESULT createResourceData(Device* device,
       desc.CPUAccessFlags = ((args->MapFlags & D3D10_DDI_CPU_ACCESS_READ) ? D3D11_CPU_ACCESS_READ : 0)
                          | ((args->MapFlags & D3D10_DDI_CPU_ACCESS_WRITE) ? D3D11_CPU_ACCESS_WRITE : 0);
       ComPtr<ID3D11Texture2D> texture;
-      hr = device->backend->CreateTexture2D(&desc, data, &texture);
+      if (shared || (presentable && desc.SampleDesc.Count == 1))
+        hr = dxvk::umd::createSharedTexture(device->backend.Get(), desc, data, &texture);
+      else
+        hr = device->backend->CreateTexture2D(&desc, data, &texture);
       resource->backend = texture;
     }
     if (hr == S_OK && !resource->backend) hr = E_FAIL;
@@ -1053,7 +1061,7 @@ void APIENTRY destroyResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE resource) {
   // A nested destroy may run inside Resolve's synchronized Lock callback.
   // That handoff already pins this surface and has its staging texture
   // mapped; let it finish rather than remapping the same texture recursively.
-  if (object->shared && object->shared->state.dirty
+  if (object->shared && !object->shared->state.damage.empty()
       && object->shared.get() != device->resolvingShared.load()) {
     const HRESULT hr = dxvk::umd::publishSharedSurface(device->backend.Get(),
       device->context.Get(), device->memory, *object->shared, device->sharedEpoch);
@@ -1421,6 +1429,7 @@ void APIENTRY resolveResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT d
       device->error(DXGI_ERROR_UNSUPPORTED); return;
     }
     device->context->ResolveSubresource(destination.Get(), dstIndex, source.Get(), srcIndex, format);
+    wroteSharedSurface(device, get(dst)->shared);
   } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
     catch (...) { device->error(E_FAIL); }
 }
@@ -1564,12 +1573,13 @@ void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstInd
             {box.right - box.left, box.bottom - box.top, box.back - box.front}))) {
     device->error(E_INVALIDARG); return;
   }
-  if (!readSharedSurface(device, get(src)->shared)) return;
+  if (!readSharedSurface(device, get(src)->shared, {box.left, box.top, box.right, box.bottom})) return;
   const bool replacesDestination = !x && !y && !z
     && box.right - box.left == destination.width && box.bottom - box.top == destination.height
     && box.back - box.front == destination.depth;
   if (replacesDestination) wroteSharedSurface(device, get(dst)->shared);
-  else if (!wroteSharedRegion(device, get(dst)->shared)) return;
+  else if (!wroteSharedRegion(device, get(dst)->shared,
+      {x, y, x + (box.right - box.left), y + (box.bottom - box.top)})) return;
   try {
     if (source.dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D
         && source.format != destination.format
@@ -1631,7 +1641,7 @@ void APIENTRY updateResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT in
   const bool replacesDestination = !box.left && !box.top && !box.front
     && box.right == destination.width && box.bottom == destination.height && box.back == destination.depth;
   if (replacesDestination) wroteSharedSurface(device, get(dst)->shared);
-  else if (!wroteSharedRegion(device, get(dst)->shared)) return;
+  else if (!wroteSharedRegion(device, get(dst)->shared, {box.left, box.top, box.right, box.bottom})) return;
   try {
     device->context->UpdateSubresource(get(dst)->backend.Get(), index, input ? &box : nullptr,
       source, rowPitch, depthPitch);
@@ -2000,7 +2010,18 @@ void APIENTRY setScissors(D3D10DDI_HDEVICE h, UINT count, UINT clear, const D3D1
   D3D11_RECT rects[slots] = {};
   for (UINT i = 0; i < count; i++)
     rects[i] = {input[i].left, input[i].top, input[i].right, input[i].bottom};
-  try { device->context->RSSetScissorRects(count, count ? rects : nullptr); }
+  try {
+    device->context->RSSetScissorRects(count, count ? rects : nullptr);
+    SurfaceRect bounds;
+    for (UINT i = 0; i < count; ++i) {
+      const auto& r = rects[i];
+      // DXVK retains the previous slot for a reversed rectangle.
+      if (r.left > r.right || r.top > r.bottom) { bounds = SurfaceRect::full(); break; }
+      bounds.include({UINT(std::max(0L, r.left)), UINT(std::max(0L, r.top)),
+                      UINT(std::max(0L, r.right)), UINT(std::max(0L, r.bottom))});
+    }
+    device->scissorBounds = bounds;
+  }
   catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
   catch (...) { device->error(E_FAIL); }
 }
@@ -2031,7 +2052,10 @@ void APIENTRY setRasterizer(D3D10DDI_HDEVICE h, D3D10DDI_HRASTERIZERSTATE state)
   auto device = get(h);
   auto object = get(state);
   if (object && (object->owner != device || !object->backend)) { device->error(E_INVALIDARG); return; }
+  D3D11_RASTERIZER_DESC desc{};
+  if (object) object->backend->GetDesc(&desc);
   device->context->RSSetState(object ? object->backend.Get() : nullptr);
+  device->scissorEnabled = desc.ScissorEnable != FALSE;
 }
 SIZE_T APIENTRY blendSize(D3D10DDI_HDEVICE, const D3D10_DDI_BLEND_DESC*) { return sizeof(BlendState); }
 void APIENTRY createBlend(D3D10DDI_HDEVICE h, const D3D10_DDI_BLEND_DESC* args,
@@ -2296,8 +2320,9 @@ bool prepareSharedDraw(Device* device) {
     // blending, a partial viewport and a scissor all leave pixels the owning
     // process wrote, so the cache has to start from the allocation. A full
     // clear is the one case that does not, and clearTarget says so directly.
-    if (!readSharedSurface(device, surface)) return false;
-    dxvk::umd::sharedWroteRegion(surface->state);
+    const auto area = surface->allocation.clip(device->scissorEnabled
+      ? device->scissorBounds : SurfaceRect::full());
+    if (!area.empty() && !wroteSharedRegion(device, surface, area)) return false;
   }
   return true;
 }
@@ -2833,8 +2858,9 @@ HRESULT bltData(Device* device, const DXGI_DDI_ARG_BLT& request) {
   const bool wholeDestination = request.DstLeft == 0 && request.DstTop == 0
     && plan.width == std::max(1u, dstDesc.Width >> (request.DstSubresource % dstDesc.MipLevels))
     && plan.height == std::max(1u, dstDesc.Height >> (request.DstSubresource % dstDesc.MipLevels));
+  const SurfaceRect dstRect{request.DstLeft, request.DstTop, request.DstRight, request.DstBottom};
   if (destination.shared && !wholeDestination) {
-    hr = dxvk::umd::refreshSharedSurface(backend.Get(), context.Get(), device->memory, *destination.shared, epoch);
+    hr = dxvk::umd::refreshSharedSurface(backend.Get(), context.Get(), device->memory, *destination.shared, epoch, dstRect);
     if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
     if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
   }
@@ -2844,7 +2870,7 @@ HRESULT bltData(Device* device, const DXGI_DDI_ARG_BLT& request) {
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
   if (destination.shared) {
     if (wholeDestination) dxvk::umd::sharedWroteWhole(destination.shared->state, epoch);
-    else dxvk::umd::sharedWroteRegion(destination.shared->state);
+    else dxvk::umd::sharedWroteRegion(destination.shared->state, dstRect);
   }
   if (request.Flags.Present) {
     device->resolvingShared = destination.shared.get();

@@ -1,6 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 #include "umd_allocation.h"
+#include "umd_api.h"
 #include "umd_shared_policy.h"
 #include "umd_private_transfer.h"
 #include <d3d11.h>
@@ -46,11 +47,14 @@ inline HRESULT sharedStaging(ID3D11Device* device, SharedSurface& surface) {
 // predicate and bindings. Keep Map on the immediate context: deferred Map
 // cannot read/write STAGING, and the synchronized Map is our completion barrier.
 inline HRESULT copySharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
-    ID3D11Texture2D* destination, ID3D11Texture2D* source) {
+    ID3D11Texture2D* destination, ID3D11Texture2D* source, SurfaceTransfer region) {
   if (!device || !context || !source || !destination
       || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return E_INVALIDARG;
   UnpredicatedTransfer transfer(context);
-  context->CopyResource(destination, source);
+  region.forEach([&](SurfaceRect area) {
+    const D3D11_BOX box{area.left, area.top, 0, area.right, area.bottom, 1};
+    context->CopySubresourceRegion(destination, 0, area.left, area.top, 0, source, 0, &box);
+  });
   return device->GetDeviceRemovedReason();
 }
 
@@ -58,18 +62,31 @@ inline HRESULT copySharedSurface(ID3D11Device* device, ID3D11DeviceContext* cont
 // the staging hop, the synchronized map that acts as the GPU barrier and the
 // balancing unmap are identical, and only the order of the two copies differs.
 inline HRESULT transferSharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
-    RuntimeMemory& memory, SharedSurface& surface, bool publish) {
+    RuntimeMemory& memory, SharedSurface& surface, bool publish, SurfaceTransfer region, SharedReadGuard guard = {}) {
   if (!device || !context || !surface.cache || !surface.allocation.handle())
     return E_INVALIDARG;
+  region.bounds = surface.allocation.clip(region.bounds);
+  if (region.keep.contains(region.bounds)) return S_OK;
   if (surface.transferring.exchange(true)) return DXGI_ERROR_WAS_STILL_DRAWING;
   struct TransferScope {
     std::atomic<bool>& active;
     ~TransferScope() { active = false; }
   } transferScope{surface.transferring};
+  if (hasSharedImageMapping(surface.cache.Get())) {
+    HRESULT hr = memory.transferImage(surface.allocation, context, surface.cache.Get(), publish, region, guard);
+    if (hr == S_OK && publish) {
+      static const bool reported = [] {
+        OutputDebugStringA("[qcdx_dxvk] Published mapped linear image to VidMM\n");
+        return true;
+      }();
+      (void)reported;
+    }
+    return hr;
+  }
   HRESULT hr = sharedStaging(device, surface);
   if (FAILED(hr)) return hr;
   if (publish) {
-    hr = copySharedSurface(device, context, surface.staging.Get(), surface.cache.Get());
+    hr = copySharedSurface(device, context, surface.staging.Get(), surface.cache.Get(), region);
     if (FAILED(hr)) return hr;
   }
   D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -81,33 +98,48 @@ inline HRESULT transferSharedSurface(ID3D11Device* device, ID3D11DeviceContext* 
   hr = context->Map(surface.staging.Get(), 0,
     publish ? D3D11_MAP_READ : D3D11_MAP_WRITE, 0, &mapped);
   if (FAILED(hr)) return hr;
-  hr = publish ? memory.upload(surface.allocation, mapped.pData, mapped.RowPitch)
-               : memory.download(surface.allocation, mapped.pData, mapped.RowPitch);
+  hr = publish ? memory.upload(surface.allocation, mapped.pData, mapped.RowPitch, region.bounds)
+               : memory.download(surface.allocation, mapped.pData, mapped.RowPitch, region, guard);
   context->Unmap(surface.staging.Get(), 0);
-  if (FAILED(hr)) return hr;
-  if (!publish) return copySharedSurface(device, context, surface.cache.Get(), surface.staging.Get());
+  if (hr != S_OK) return hr;
+  if (!guard.current()) return DXGI_ERROR_WAS_STILL_DRAWING;
+  if (!publish) return copySharedSurface(device, context, surface.cache.Get(), surface.staging.Get(), region);
   return S_OK;
-}
-
-// Read the owning process's pixels into the cache, at most once per epoch.
-inline HRESULT refreshSharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
-    RuntimeMemory& memory, SharedSurface& surface, uint64_t epoch) {
-  if (!sharedNeedsRefresh(surface.state, epoch)) {
-    sharedRefreshed(surface.state, epoch);
-    return S_OK;
-  }
-  const HRESULT hr = transferSharedSurface(device, context, memory, surface, false);
-  if (SUCCEEDED(hr)) sharedRefreshed(surface.state, epoch);
-  return hr;
 }
 
 // Write this device's pixels back out. A no-op unless the cache is dirty.
 inline HRESULT publishSharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
     RuntimeMemory& memory, SharedSurface& surface, uint64_t epoch) {
-  if (!surface.state.dirty) return S_OK;
-  const HRESULT hr = transferSharedSurface(device, context, memory, surface, true);
-  if (SUCCEEDED(hr)) sharedPublished(surface.state, epoch);
-  return hr;
+  if (surface.state.damage.empty()) return S_OK;
+  // Replay a write made by a lock callback once. If callbacks keep writing,
+  // leave the accumulated damage intact and let the caller retry the handoff.
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    const auto serial = surface.state.writeSerial;
+    const HRESULT hr = transferSharedSurface(device, context, memory, surface, true, {surface.state.damage, {}});
+    if (hr != S_OK) return hr;
+    if (serial == surface.state.writeSerial) {
+      sharedPublished(surface.state, epoch);
+      return S_OK;
+    }
+  }
+  return DXGI_ERROR_WAS_STILL_DRAWING;
+}
+
+// Grow the valid rectangle on demand. Never replace pixels already drawn by
+// this device. All missing strips share one allocation lock and image map.
+inline HRESULT refreshSharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
+    RuntimeMemory& memory, SharedSurface& surface, uint64_t epoch, SurfaceRect needed = SurfaceRect::full()) {
+  needed = surface.allocation.clip(needed);
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    const auto region = sharedReadPlan(surface.state, epoch, needed);
+    if (region.keep.contains(region.bounds)) return S_OK;
+    SharedReadGuard guard{&surface.state, surface.state.writeSerial};
+    const HRESULT hr = transferSharedSurface(device, context, memory, surface, false, region, guard);
+    if (!guard.current() && (hr == S_OK || hr == DXGI_ERROR_WAS_STILL_DRAWING)) continue;
+    if (hr == S_OK) sharedRefreshed(surface.state, epoch, region.bounds);
+    return hr;
+  }
+  return DXGI_ERROR_WAS_STILL_DRAWING;
 }
 
 // Drop the memoized read after re-pairing this surface with a different

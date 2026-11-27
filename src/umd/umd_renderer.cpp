@@ -14,7 +14,11 @@ static HRESULT loadDriver(Rc<vk::LibraryFn>& library) {
   path.resize(length);
   auto slash = path.rfind(L'\\');
   if (slash == path.npos) return HRESULT_FROM_WIN32(ERROR_BAD_PATHNAME);
+#if defined(_M_IX86) || defined(__i386__)
+  path.replace(slash + 1, path.npos, L"vulkan_freedreno_x86.dll");
+#else
   path.replace(slash + 1, path.npos, L"vulkan_freedreno.dll");
+#endif
   struct Module {
     HMODULE value;
     ~Module() { if (value) FreeLibrary(value); }

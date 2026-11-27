@@ -4,7 +4,8 @@
 #include "qcdx_escape.h"
 
 namespace dxvk::umd {
-inline HRESULT queryAdapterLuid(HANDLE handle, const D3DDDI_ADAPTERCALLBACKS& callbacks, LUID& luid) {
+inline HRESULT queryAdapterLuid(HANDLE handle, const D3DDDI_ADAPTERCALLBACKS& callbacks, LUID& luid,
+                                UINT* features = nullptr) {
   qcdx_adapter_info_luid info = {};
   static_assert(sizeof(info) == 24);
   D3DDDICB_QUERYADAPTERINFO query = {};
@@ -16,6 +17,7 @@ inline HRESULT queryAdapterLuid(HANDLE handle, const D3DDDI_ADAPTERCALLBACKS& ca
       !(info.base.features & QCDX_CAP_VIDMM_GPUVA) || !(info.luid_low || info.luid_high))
     return DXGI_ERROR_UNSUPPORTED;
   luid = {info.luid_low, info.luid_high};
+  if (features) *features = info.base.features;
   return S_OK;
 }
 }

@@ -14,7 +14,11 @@ struct VidmmSurface {
   HANDLE resource = nullptr;
   D3DKMT_HANDLE handle = 0;
   qcdx_alloc layout = {};
-  bool locked = false;
+  D3DKMT_HANDLE publishSource = 0;
+  void* publishAddress = nullptr;
+  UINT publishPitch = 0;
+  D3DDDI_ALLOCATIONINFO2* pendingSource = nullptr;
+  bool locked = false, publishing = false;
   // Runtime callbacks can reenter teardown after assigning an output handle.
   D3DDDICB_ALLOCATE* pendingAllocate = nullptr;
   D3DDDICB_LOCK2* pendingLock = nullptr;
@@ -48,7 +52,7 @@ class RuntimeMemory {
 public:
   using Live = std::function<bool()>;
   void initialize(HANDLE device, const D3DDDI_DEVICECALLBACKS& callbacks,
-                  const DXGI_DDI_BASE_CALLBACKS* dxgi);
+                  const DXGI_DDI_BASE_CALLBACKS* dxgi, bool gpuPublish = false);
   bool available() const { return device && !closing && (dxgi ? dxgi->pfnPresentCb != nullptr : callbacks.pfnPresentCb != nullptr); }
   bool primaryAvailable() const { return available() && callbacks.pfnSetDisplayModeCb; }
   HRESULT allocate(RuntimeAllocation& out, HANDLE resource, UINT width, UINT height,
@@ -71,8 +75,13 @@ private:
   HRESULT ensureContext(const Live& live);
   template<typename GetPixels>
   HRESULT transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region, SharedReadGuard guard, GetPixels getPixels);
+  HRESULT publishGpu(RuntimeAllocation& out, ID3D11DeviceContext* context, ID3D11Texture2D* image, SurfaceRect area);
+  HRESULT createPublishSource(VidmmSurface& binding, const D3D11_MAPPED_SUBRESOURCE& pixels);
+  HRESULT dropPublishSource(VidmmSurface& binding);
   HRESULT release(const std::shared_ptr<VidmmSurface>& surface);
-  HANDLE device = nullptr, context = nullptr;
+  HANDLE device = nullptr, context = nullptr, copyEvent = nullptr;
+  D3DDDICB_RENDER copyBuffers = {};
+  bool gpuPublish = false, copying = false;
   D3DDDI_DEVICECALLBACKS callbacks = {};
   const DXGI_DDI_BASE_CALLBACKS* dxgi = nullptr;
   std::list<std::shared_ptr<VidmmSurface>> surfaces;

@@ -21,6 +21,9 @@ DXGI_FORMAT allocationFormat(const qcdx_alloc& a) {
 }
 static UINT pixelBytes(const qcdx_alloc& a) { return a.format == 113 ? 8u : 4u; }
 static UINT rowBytes(const qcdx_alloc& a) { return a.width * pixelBytes(a); }
+static bool unsupportedCopy(HRESULT hr) {
+  return hr == E_NOTIMPL || hr == E_INVALIDARG || hr == DXGI_ERROR_UNSUPPORTED;
+}
 static bool validSurface(const qcdx_alloc& a) {
   constexpr auto knownFlags = QCDX_ALLOC_F_DIRECT | QCDX_ALLOC_F_PRIMARY | QCDX_ALLOC_F_SRGB;
   return a.magic == QCDX_ALLOC_MAGIC && !a.bo && !a.bo_offset && !(a.flags & ~knownFlags)
@@ -41,7 +44,7 @@ bool RuntimeAllocation::canRotateWith(const RuntimeAllocation& other) const {
   const auto& b = other.surface->layout;
   return surface->owner && surface->owner == other.surface->owner && surface->handle &&
       other.surface->handle && !surface->locked && !other.surface->locked &&
-      !surface->pendingLock && !other.surface->pendingLock &&
+      !surface->pendingLock && !other.surface->pendingLock && !surface->publishing && !other.surface->publishing &&
       a.width == b.width && a.height == b.height && a.format == b.format;
 }
 void RuntimeAllocation::swapIdentity(RuntimeAllocation& other) {
@@ -51,9 +54,14 @@ void RuntimeAllocation::swapIdentity(RuntimeAllocation& other) {
   // The runtime rotates its resource-to-allocation associations at return.
 }
 void RuntimeMemory::initialize(HANDLE rtDevice, const D3DDDI_DEVICECALLBACKS& cb,
-                               const DXGI_DDI_BASE_CALLBACKS* dxgiCallbacks) {
+                               const DXGI_DDI_BASE_CALLBACKS* dxgiCallbacks, bool allowPublish) {
   device = rtDevice;
   dxgi = dxgiCallbacks;
+  if (allowPublish) {
+    callbacks.pfnRenderCb = cb.pfnRenderCb;
+    callbacks.pfnSignalSynchronizationObject2Cb = cb.pfnSignalSynchronizationObject2Cb;
+    gpuPublish = cb.pfnRenderCb && cb.pfnSignalSynchronizationObject2Cb;
+  }
   if (!dxgi) callbacks.pfnPresentCb = cb.pfnPresentCb;
   callbacks.pfnAllocateCb = cb.pfnAllocateCb;
   callbacks.pfnDeallocate2Cb = cb.pfnDeallocate2Cb;
@@ -141,6 +149,9 @@ HRESULT RuntimeMemory::release(const std::shared_ptr<VidmmSurface>& binding) {
     hr = callbacks.pfnUnlock2Cb(device, &unlock);
     if (binding->owner != this) return hr;
   }
+  const HRESULT sourceResult = dropPublishSource(*binding);
+  if (binding->owner != this) return sourceResult;
+  if (FAILED(sourceResult)) hr = sourceResult;
   binding->owner = nullptr;
   binding->handle = 0;
   auto resource = std::exchange(binding->resource, nullptr);
@@ -209,6 +220,148 @@ HRESULT RuntimeMemory::download(RuntimeAllocation& out, void* data, UINT pitch, 
     return S_OK;
   });
 }
+HRESULT RuntimeMemory::dropPublishSource(VidmmSurface& binding) {
+  if (auto pending = std::exchange(binding.pendingSource, nullptr))
+    binding.publishSource = pending->hAllocation;
+  auto handle = std::exchange(binding.publishSource, 0);
+  if (!handle) return S_OK;
+  D3DDDICB_DEALLOCATE2 drop = {};
+  drop.NumAllocations = 1;
+  drop.HandleList = &handle;
+  drop.Flags.SynchronousDestroy = TRUE;
+  return callbacks.pfnDeallocate2Cb(device, &drop);
+}
+
+HRESULT RuntimeMemory::createPublishSource(VidmmSurface& binding, const D3D11_MAPPED_SUBRESOURCE& pixels) {
+  auto hr = dropPublishSource(binding);
+  if (binding.owner != this) return DXGI_ERROR_DEVICE_REMOVED;
+  if (FAILED(hr)) return hr;
+  qcdx_alloc src = {};
+  src.magic = QCDX_ALLOC_MAGIC;
+  src.kind = QCDX_ALLOC_UMD;
+  src.flags = QCDX_ALLOC_F_PUBLISH_SOURCE;
+  src.width = binding.layout.width;
+  src.height = binding.layout.height;
+  src.format = binding.layout.format;
+  src.pitch = pixels.RowPitch;
+  src.size = pixels.RowPitch * src.height;
+  const auto address = uint64_t(reinterpret_cast<uintptr_t>(pixels.pData));
+  src.reserved[0] = static_cast<UINT>(address);
+  src.reserved[1] = static_cast<UINT>(address >> 32);
+  D3DDDI_ALLOCATIONINFO2 info = {};
+  info.pSystemMem = pixels.pData;
+  info.pPrivateDriverData = &src;
+  info.PrivateDriverDataSize = sizeof(src);
+  D3DDDICB_ALLOCATE create = {};
+  create.NumAllocations = 1;
+  create.pAllocationInfo2 = &info;
+  binding.pendingSource = &info;
+  hr = callbacks.pfnAllocateCb(device, &create);
+  binding.pendingSource = nullptr;
+  if (binding.owner != this) return DXGI_ERROR_DEVICE_REMOVED;
+  binding.publishSource = info.hAllocation;
+  if (hr != S_OK || !info.hAllocation) {
+    const HRESULT dropped = dropPublishSource(binding);
+    if (binding.owner != this) return DXGI_ERROR_DEVICE_REMOVED;
+    if (FAILED(dropped)) return dropped;
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG)
+      return hr;
+    return S_FALSE;
+  }
+  binding.publishAddress = pixels.pData;
+  binding.publishPitch = pixels.RowPitch;
+  return S_OK;
+}
+
+HRESULT RuntimeMemory::publishGpu(RuntimeAllocation& out, ID3D11DeviceContext* ctx,
+                                  ID3D11Texture2D* image, SurfaceRect area) {
+  auto binding = out.surface;
+  const auto layout = binding->layout;
+  if (area.empty()) return S_OK;
+  if ((layout.pitch & 31) || binding->locked || binding->pendingLock) return S_FALSE;
+  struct CopyScope {
+    bool& deviceBusy;
+    VidmmSurface& surface;
+    ~CopyScope() { deviceBusy = false; surface.publishing = false; }
+  } scope{copying, *binding};
+  copying = binding->publishing = true;
+  const auto destination = binding->handle;
+  const auto live = [&] { return available() && binding->owner == this && binding->handle == destination; };
+  HRESULT hr = ensureContext(live);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return unsupportedCopy(hr) ? S_FALSE : hr;
+  if (!copyBuffers.pNewCommandBuffer || copyBuffers.NewCommandBufferSize < sizeof(qcdx_region_command) ||
+      !copyBuffers.pNewAllocationList || copyBuffers.NewAllocationListSize < 2)
+    return S_FALSE;
+  if (!copyEvent) copyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!copyEvent) return S_FALSE;
+
+  D3D11_MAPPED_SUBRESOURCE pixels = {};
+  hr = getSharedImageMapping(ctx, image, true, &pixels);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return hr;
+  const auto address = uint64_t(reinterpret_cast<uintptr_t>(pixels.pData));
+  const auto bytes = uint64_t(pixels.RowPitch) * layout.height;
+  const bool alternateRows = ((pixels.RowPitch | layout.pitch) & 63) != 0;
+  const UINT maxPitch = 0x7fff * (alternateRows ? 32u : 64u);
+  if (!address || (address & 4095) || (pixels.RowPitch & 31) || (alternateRows && layout.width + 8 > 0x4000) ||
+      std::max(pixels.RowPitch, layout.pitch) > maxPitch || pixels.RowPitch < rowBytes(layout) ||
+      bytes > maxSurfaceSize) return S_FALSE;
+
+  if (!binding->publishSource || binding->publishAddress != pixels.pData || binding->publishPitch != pixels.RowPitch) {
+    hr = createPublishSource(*binding, pixels);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return hr;
+    // AllocateCb may have run new draws. Drain them before the first copy
+    // from this alias and leave a changed mapping for the CPU path.
+    hr = getSharedImageMapping(ctx, image, true, &pixels);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return hr;
+    if (binding->publishAddress != pixels.pData || binding->publishPitch != pixels.RowPitch) return S_FALSE;
+  }
+  qcdx_region_command command = {};
+  command.header.magic = QCDX_ESC_MAGIC;
+  command.header.operation = QCDX_RENDER_COPY_REGION;
+  command.region = {area.left, area.top, area.left, area.top, area.right - area.left, area.bottom - area.top};
+  std::memcpy(copyBuffers.pNewCommandBuffer, &command, sizeof(command));
+  auto list = copyBuffers.pNewAllocationList;
+  list[0] = {};
+  list[0].hAllocation = binding->publishSource;
+  list[1] = {};
+  list[1].hAllocation = destination;
+  list[1].WriteOperation = TRUE;
+  D3DDDICB_RENDER render = {};
+  render.hContext = context;
+  render.NumAllocations = 2;
+  render.CommandLength = sizeof(command);
+  hr = callbacks.pfnRenderCb(device, &render);
+  if (!available()) return DXGI_ERROR_DEVICE_REMOVED;
+  copyBuffers = render;
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (unsupportedCopy(hr)) {
+    gpuPublish = false;
+    const HRESULT retired = dropPublishSource(*binding);
+    if (!live() || FAILED(retired)) return DXGI_ERROR_DEVICE_REMOVED;
+    return S_FALSE;
+  }
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+
+  D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signal = {};
+  signal.hContext = context;
+  signal.Flags.EnqueueCpuEvent = TRUE;
+  signal.CpuEventHandle = copyEvent;
+  hr = callbacks.pfnSignalSynchronizationObject2Cb(device, &signal);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr == S_OK && WaitForSingleObject(copyEvent, 5000) == WAIT_OBJECT_0) return S_OK;
+  // The copy was accepted. Retire its source synchronously before the
+  // producer can reuse it, including when the runtime rejects the signal.
+  gpuPublish = false;
+  const HRESULT retired = dropPublishSource(*binding);
+  if (!live() || FAILED(retired)) return DXGI_ERROR_DEVICE_REMOVED;
+  if (unsupportedCopy(hr)) return S_OK;
+  return FAILED(hr) ? hr : DXGI_ERROR_DEVICE_HUNG;
+}
+
 HRESULT RuntimeMemory::transferImage(RuntimeAllocation& out, ID3D11DeviceContext* context,
                                     ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard) {
   if (publish) {
@@ -220,6 +373,10 @@ HRESULT RuntimeMemory::transferImage(RuntimeAllocation& out, ID3D11DeviceContext
     if (!available() || !out.handle()) return DXGI_ERROR_DEVICE_REMOVED;
     if (hr != S_OK) return hr;
     if (out.handle() != allocation) return DXGI_ERROR_WAS_STILL_DRAWING;
+    if (gpuPublish && !copying && out.surface->layout.format == 21 && region.keep.empty()) {
+      const HRESULT copied = publishGpu(out, context, image, out.clip(region.bounds));
+      if (copied != S_FALSE) return copied;
+    }
   }
   return transfer(out, publish, region, guard, [&](D3D11_MAPPED_SUBRESOURCE& pixels) {
     return getSharedImageMapping(context, image, publish, &pixels);
@@ -244,6 +401,10 @@ HRESULT RuntimeMemory::ensureContext(const Live& live) {
     if (!available()) return DXGI_ERROR_DEVICE_REMOVED;
     if (hr != S_OK || !create.hContext) return FAILED(hr) ? hr : E_FAIL;
     context = create.hContext;
+    copyBuffers.pNewCommandBuffer = create.pCommandBuffer;
+    copyBuffers.NewCommandBufferSize = create.CommandBufferSize;
+    copyBuffers.pNewAllocationList = create.pAllocationList;
+    copyBuffers.NewAllocationListSize = create.AllocationListSize;
     if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
   }
   return S_OK;
@@ -307,6 +468,7 @@ HRESULT RuntimeMemory::closeDeviceAllocations() {
     auto hr = callbacks.pfnDestroyContextCb(device, &destroy);
     if (FAILED(hr)) result = hr;
   }
+  if (copyEvent) CloseHandle(std::exchange(copyEvent, nullptr));
   device = nullptr;
   return result;
 }

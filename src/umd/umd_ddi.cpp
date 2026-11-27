@@ -3277,7 +3277,8 @@ void populateDeviceFunctions(Table* table) {
 }
 
 template<typename Table, typename Callbacks>
-HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native, Table* table, Callbacks* callbacks) {
+HRESULT createDdiDevice(const dxvk::umd::AdapterIdentity& adapter, D3D10DDIARG_CREATEDEVICE* native,
+                        Table* table, Callbacks* callbacks) {
   const auto h = native->hDrvDevice;
   constexpr bool isD3D11 = std::is_same_v<Table, D3D11DDI_DEVICEFUNCS>;
   if (!h.pDrvPrivate || uintptr_t(h.pDrvPrivate) % alignof(DevicePrivate)
@@ -3303,13 +3304,13 @@ HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native, Tabl
   if constexpr (isD3D11) device->callbacks11 = callbacks;
   else device->callbacks10 = callbacks;
   device->memory.initialize(native->hRTDevice.handle, *native->pKTCallbacks,
-    native->DXGIBaseDDI.pDXGIBaseCallbacks);
+    native->DXGIBaseDDI.pDXGIBaseCallbacks, adapter.gpuPublish);
   const bool dxgi11 = dxvk::umd::nativeDxgiUses1_1(native->Interface, native->Version);
   auto dxgiTable = dxgi11 ? nullptr : native->DXGIBaseDDI.pDXGIDDIBaseFunctions;
   auto dxgiTable11 = dxgi11 ? native->DXGIBaseDDI.pDXGIDDIBaseFunctions2 : nullptr;
   const HRESULT hr = device->service->run([&] {
     const bool disableExtraThreads = native->Flags & D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION;
-    return dxvk::umd::createDevice(luid, device->featureLevel, disableExtraThreads,
+    return dxvk::umd::createDevice(adapter.luid, device->featureLevel, disableExtraThreads,
       &device->backend, &device->context);
   });
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
@@ -3365,6 +3366,6 @@ HRESULT dxvk::umd::createAdapterDevice(
   if (!supportedNativeInterface(args->Interface, args->Version, args->Flags)) return DXGI_ERROR_UNSUPPORTED;
   if (!args->pKTCallbacks || !args->hRTDevice.handle) return E_INVALIDARG;
   if (isD3D10Interface(args->Interface))
-    return createDdiDevice(identity->luid, args, args->pDeviceFuncs, args->pUMCallbacks);
-  return createDdiDevice(identity->luid, args, args->p11DeviceFuncs, args->p11UMCallbacks);
+    return createDdiDevice(*identity, args, args->pDeviceFuncs, args->pUMCallbacks);
+  return createDdiDevice(*identity, args, args->p11DeviceFuncs, args->p11UMCallbacks);
 }

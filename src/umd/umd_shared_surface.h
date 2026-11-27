@@ -15,10 +15,10 @@ namespace dxvk::umd {
 // that other D3D devices can open. Publish dirty pixels at handoff and refresh
 // the renderable image on the first read in each ownership epoch.
 struct SharedSurface {
-  RuntimeAllocation allocation;
   // The renderable copy. This is the same object as the owning Resource's
   // backend; the surface holds it so a view can outlive the resource DDI.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> cache;
+  RuntimeAllocation allocation;
   // CPU-visible transfer texture, created on first use.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
   // When this cache last read the allocation and whether it owes it a write.

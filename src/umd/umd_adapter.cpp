@@ -77,11 +77,13 @@ static HRESULT openAdapter(D3D10DDIARG_OPENADAPTER* args, Table* output) {
       !args->pAdapterCallbacks || !args->pAdapterCallbacks->pfnQueryAdapterInfoCb) return E_INVALIDARG;
   args->hAdapter = {};
   LUID luid;
-  HRESULT hr = dxvk::umd::queryAdapterLuid(args->hRTAdapter.handle, *args->pAdapterCallbacks, luid);
+  UINT features = 0;
+  HRESULT hr = dxvk::umd::queryAdapterLuid(args->hRTAdapter.handle, *args->pAdapterCallbacks, luid, &features);
   if (FAILED(hr)) return hr;
   try {
     auto identity = std::make_shared<dxvk::umd::AdapterIdentity>();
     identity->luid = luid;
+    identity->gpuPublish = (features & QCDX_CAP_GPU_PUBLISH) != 0;
     std::lock_guard lock(adaptersMutex);
     if (!nextToken) return E_OUTOFMEMORY;
     auto token = reinterpret_cast<void*>(nextToken++);

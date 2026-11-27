@@ -88,7 +88,6 @@ inline HRESULT bltPlan(const D3D11_TEXTURE2D_DESC& src,
 // All intermediates and immutable pipeline objects exist before any commands
 // are recorded. The private deferred context starts with no predication or
 // application bindings; ExecuteCommandList(TRUE) restores the original state.
-// Only the final GPU copy modifies the destination rectangle, including Present.
 template<typename Live>
 inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
     ID3D11Texture2D* source, ID3D11Texture2D* destination, UINT sourceSubresource,
@@ -206,11 +205,6 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
       if (!encodedMultisample) return E_FAIL;
     }
   }
-  scratchDesc.Width = plan.width; scratchDesc.Height = plan.height;
-  scratchDesc.Format = plan.destinationFormat; scratchDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-  hr = device->CreateTexture2D(&scratchDesc, nullptr, &rendered);
-  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
-  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
   ComPtr<ID3D11ShaderResourceView> srv; ComPtr<ID3D11RenderTargetView> rtv;
   ComPtr<ID3D11RenderTargetView> resolveRtv;
   if (encodedShaderResolve) {
@@ -222,9 +216,33 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   hr = device->CreateShaderResourceView(sampled.Get(), nullptr, &srv);
   if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
-  hr = device->CreateRenderTargetView(rendered.Get(), nullptr, &rtv);
-  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
-  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  // For a full-surface blit the viewport already matches the destination.
+  // Use a linear view so sRGB backbuffers receive the same encoded bytes.
+  D3D11_TEXTURE2D_DESC dstDesc{};
+  destination->GetDesc(&dstDesc);
+  if (!destinationSubresource && dstDesc.ArraySize == 1 && !left && !top
+      && dstDesc.Width == plan.width && dstDesc.Height == plan.height
+      && !presentX8Format(plan.destinationFormat)
+      && (dstDesc.Format == plan.destinationFormat
+        || dstDesc.Format == presentCacheFormat(plan.destinationFormat))) {
+    D3D11_RENDER_TARGET_VIEW_DESC view{};
+    view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    view.Format = plan.destinationFormat;
+    hr = device->CreateRenderTargetView(destination, &view, &rtv);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK && hr != E_INVALIDARG && hr != DXGI_ERROR_UNSUPPORTED)
+      return FAILED(hr) ? hr : E_FAIL;
+  }
+  if (!rtv) {
+    scratchDesc.Width = plan.width; scratchDesc.Height = plan.height;
+    scratchDesc.Format = plan.destinationFormat; scratchDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    hr = device->CreateTexture2D(&scratchDesc, nullptr, &rendered);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK || !rendered) return FAILED(hr) ? hr : E_FAIL;
+    hr = device->CreateRenderTargetView(rendered.Get(), nullptr, &rtv);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  }
   D3D11_SAMPLER_DESC samplerDesc{};
   samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
   samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -244,7 +262,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   hr = device->CreateDeferredContext(0, &commands);
   if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
-  if (!vs || !ps || !layout || !vb || !sampled || !rendered || !srv || !rtv || !sampler || !raster || !commands)
+  if (!vs || !ps || !layout || !vb || !sampled || !srv || !rtv || !sampler || !raster || !commands)
     return E_FAIL;
   if (encodedMultisample) commands->CopySubresourceRegion(encodedMultisample.Get(), 0,
     0, 0, 0, source, sourceSubresource, nullptr);
@@ -277,7 +295,8 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   commands->RSSetState(raster.Get());
   const D3D11_VIEWPORT viewport{0, 0, FLOAT(plan.width), FLOAT(plan.height), 0, 1};
   commands->RSSetViewports(1, &viewport); commands->Draw(3, 0);
-  commands->CopySubresourceRegion(destination, destinationSubresource, left, top, 0, rendered.Get(), 0, nullptr);
+  if (rendered)
+    commands->CopySubresourceRegion(destination, destinationSubresource, left, top, 0, rendered.Get(), 0, nullptr);
   ComPtr<ID3D11CommandList> list;
   hr = commands->FinishCommandList(FALSE, &list);
   if (!live()) return DXGI_ERROR_DEVICE_REMOVED;

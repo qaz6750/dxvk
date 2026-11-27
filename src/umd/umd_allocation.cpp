@@ -211,6 +211,16 @@ HRESULT RuntimeMemory::download(RuntimeAllocation& out, void* data, UINT pitch, 
 }
 HRESULT RuntimeMemory::transferImage(RuntimeAllocation& out, ID3D11DeviceContext* context,
                                     ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard) {
+  if (publish) {
+    const auto allocation = out.handle();
+    if (!available() || !allocation) return DXGI_ERROR_DEVICE_REMOVED;
+    // Submit the producer's draws before taking the compositor's allocation
+    // lock. Lock2 can call back into the DDI, so map the image after it returns.
+    const HRESULT hr = flushRuntimeSubmission(context);
+    if (!available() || !out.handle()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return hr;
+    if (out.handle() != allocation) return DXGI_ERROR_WAS_STILL_DRAWING;
+  }
   return transfer(out, publish, region, guard, [&](D3D11_MAPPED_SUBRESOURCE& pixels) {
     return getSharedImageMapping(context, image, publish, &pixels);
   });

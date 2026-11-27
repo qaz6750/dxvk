@@ -8,7 +8,20 @@ namespace dxvk::umd {
 
 // These are the five optional bits in the negotiated 10.0/10.1/11.0 DDI.
 // Public D3D11 IA, buffer, UAV and video bits are not this table's ABI.
-inline UINT nativeFormatCaps(UINT api) {
+inline UINT nativeFormatCaps(DXGI_FORMAT format, UINT api) {
+  // These views select one plane of a depth/stencil resource. Attachment
+  // support on the backing image does not make the view a color target.
+  switch (format) {
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+      api &= ~D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+      break;
+    default:
+      break;
+  }
+
   UINT result = 0;
   if (api & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) result |= D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE;
   if (api & D3D11_FORMAT_SUPPORT_RENDER_TARGET) {
@@ -35,7 +48,7 @@ HRESULT queryNativeFormatCaps(DXGI_FORMAT format, UINT* output, Check&& check) {
   UINT support = 0;
   const HRESULT hr = check(format, &support);
   if (hr != S_OK) return hr == E_INVALIDARG || SUCCEEDED(hr) ? E_FAIL : hr;
-  *output = nativeFormatCaps(support);
+  *output = nativeFormatCaps(format, support);
   return S_OK;
 }
 

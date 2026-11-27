@@ -124,7 +124,7 @@ namespace dxvk {
   std::string Logger::getFileName(const std::string& base) {
     std::string path = env::getEnvVar("DXVK_LOG_PATH");
     
-    if (path == "none")
+    if (base.empty() || path == "none")
       return std::string();
 
 #ifdef _WIN32

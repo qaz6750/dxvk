@@ -120,14 +120,14 @@ if platform == 'windows'
     wrc = find_program('rc')
     wrc_generator = generator(wrc,
       output    : [ '@BASENAME@' + res_ext ],
-      arguments : [ '/fo', '@OUTPUT@', '@INPUT@' ],
+      arguments : [ '@EXTRA_ARGS@', '/fo', '@OUTPUT@', '@INPUT@' ],
     )
   else
     res_ext = '.o'
     wrc = find_program('windres')
     wrc_generator = generator(wrc,
       output    : [ '@BASENAME@' + res_ext ],
-      arguments : [ '-i', '@INPUT@', '-o', '@OUTPUT@' ],
+      arguments : [ '@EXTRA_ARGS@', '-i', '@INPUT@', '-o', '@OUTPUT@' ],
     )
   endif
 

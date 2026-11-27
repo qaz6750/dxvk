@@ -27,11 +27,13 @@ namespace dxvk {
     void AddQuery(
             D3D11Query*         pQuery);
     
-    uint64_t AddChunk(
+    size_t GetChunkCount() const { return m_chunks.size(); }
+
+    void AddChunk(
             DxvkCsChunkRef&&    Chunk,
             uint64_t            Cost);
 
-    uint64_t AddCommandList(
+    void AddCommandList(
             D3D11CommandList*   pCommandList);
 
     void EmitToCsThread(

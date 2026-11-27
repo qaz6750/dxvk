@@ -1,0 +1,294 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+#include "umd_blt_shader.h"
+#include "umd_encoded_resolve_shader.h"
+#include "umd_present_format.h"
+#include <d3d11.h>
+#include <wrl/client.h>
+#include <algorithm>
+
+namespace dxvk::umd {
+
+inline constexpr DXGI_FORMAT bltLinearFormat(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+inline constexpr DXGI_FORMAT presentStorageFormat(DXGI_FORMAT format) {
+  if (format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R10G10B10A2_UNORM)
+    return format;
+  return bltLinearFormat(format);
+}
+struct BltPlan {
+  UINT sourceWidth = 0, sourceHeight = 0, width = 0, height = 0;
+  DXGI_FORMAT sourceFormat = DXGI_FORMAT_UNKNOWN, destinationFormat = DXGI_FORMAT_UNKNOWN;
+  bool resolve = false;
+  bool directCopy = false;
+};
+
+// The original DDI bind metadata is validated separately. Reject unsupported
+// display formats (including float/gamma conversion) rather than advertise a
+// conversion the embedded renderer has not implemented here.
+inline HRESULT bltPlan(const D3D11_TEXTURE2D_DESC& src,
+    const D3D11_TEXTURE2D_DESC& dst, UINT sourceSubresource, UINT destinationSubresource,
+    UINT left, UINT top, UINT right, UINT bottom, UINT flags, UINT rotation,
+    BltPlan& output) {
+  if ((flags & ~15u) || rotation < 1 || rotation > 4
+      || !src.Width || !src.Height || !dst.Width || !dst.Height
+      || src.Width > 16384 || src.Height > 16384 || dst.Width > 16384 || dst.Height > 16384
+      || !src.MipLevels || !dst.MipLevels || src.MipLevels > 15 || dst.MipLevels > 15
+      || !src.ArraySize || !dst.ArraySize || src.ArraySize > 2048 || dst.ArraySize > 2048
+      || sourceSubresource >= src.MipLevels * src.ArraySize
+      || destinationSubresource >= dst.MipLevels * dst.ArraySize
+      || right <= left || bottom <= top) return E_INVALIDARG;
+  const UINT dstWidth = std::max(1u, dst.Width >> (destinationSubresource % dst.MipLevels));
+  const UINT dstHeight = std::max(1u, dst.Height >> (destinationSubresource % dst.MipLevels));
+  if (right > dstWidth || bottom > dstHeight) return E_INVALIDARG;
+  if (!(dst.BindFlags & D3D11_BIND_RENDER_TARGET) || dst.Usage != D3D11_USAGE_DEFAULT
+      || src.Usage != D3D11_USAGE_DEFAULT || dst.SampleDesc.Count != 1
+      || dst.SampleDesc.Quality || !src.SampleDesc.Count) return DXGI_ERROR_UNSUPPORTED;
+  BltPlan staged;
+  staged.sourceFormat = bltLinearFormat(src.Format);
+  staged.destinationFormat = bltLinearFormat(dst.Format);
+  if (staged.sourceFormat == DXGI_FORMAT_UNKNOWN || staged.destinationFormat == DXGI_FORMAT_UNKNOWN)
+    return DXGI_ERROR_UNSUPPORTED;
+  staged.resolve = (flags & 1) != 0;
+  if (staged.resolve != (src.SampleDesc.Count > 1)) return E_INVALIDARG;
+  // X8 stays X8 through scratch sampling (alpha reads as one). MSAA X8
+  // remains unavailable; its resolve support needs independent pixel proof.
+  if (staged.resolve && (presentX8Format(src.Format) || presentX8Format(dst.Format)))
+    return DXGI_ERROR_UNSUPPORTED;
+  if (src.Format != dst.Format && !(flags & 2)) return E_INVALIDARG;
+  staged.sourceWidth = std::max(1u, src.Width >> (sourceSubresource % src.MipLevels));
+  staged.sourceHeight = std::max(1u, src.Height >> (sourceSubresource % src.MipLevels));
+  staged.width = right - left; staged.height = bottom - top;
+  const bool swapped = rotation == 2 || rotation == 4;
+  if (!(flags & 4) && (staged.width != (swapped ? staged.sourceHeight : staged.sourceWidth)
+      || staged.height != (swapped ? staged.sourceWidth : staged.sourceHeight))) return E_INVALIDARG;
+  // Same-layout sRGB/UNORM casts also preserve encoded bits and physical X.
+  // Conversion permission above is still mandatory for different formats.
+  staged.directCopy = rotation == 1 && !(flags & 5) && staged.sourceFormat == staged.destinationFormat
+    && staged.sourceWidth == staged.width && staged.sourceHeight == staged.height;
+  output = staged;
+  return S_OK;
+}
+
+// All intermediates and immutable pipeline objects exist before any commands
+// are recorded. The private deferred context starts with no predication or
+// application bindings; ExecuteCommandList(TRUE) restores the original state.
+// Only the final GPU copy modifies the destination rectangle, including Present.
+template<typename Live>
+inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
+    ID3D11Texture2D* source, ID3D11Texture2D* destination, UINT sourceSubresource,
+    UINT destinationSubresource, UINT left, UINT top, UINT rotation, const BltPlan& plan, const Live& live) {
+  using Microsoft::WRL::ComPtr;
+  if (!device || !context || !source || !destination) return E_INVALIDARG;
+  if (plan.directCopy) {
+    // Validated identity rectangles cover the whole source mip. When both
+    // handles name the very same subresource, bounds force left=top=0 and the
+    // operation is already complete. Never issue an illegal self-copy.
+    if (source == destination && sourceSubresource == destinationSubresource)
+      return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+    ComPtr<ID3D11DeviceContext> commands;
+    HRESULT hr = device->CreateDeferredContext(0, &commands);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+    if (!commands) return E_FAIL;
+    // A fresh context has no app predication or bindings. The GPU bit copy
+    // preserves all physical channels, including X8, without SRV/RTV sampling.
+    commands->CopySubresourceRegion(destination, destinationSubresource, left, top, 0,
+      source, sourceSubresource, nullptr);
+    ComPtr<ID3D11CommandList> list;
+    hr = commands->FinishCommandList(FALSE, &list);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+    if (!list) return E_FAIL;
+    context->ExecuteCommandList(list.Get(), TRUE);
+    return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+  }
+  D3D11_TEXTURE2D_DESC sourceDesc{};
+  bool encodedShaderResolve = false;
+  bool decodedSrgbResolve = false;
+  ComPtr<ID3D11ShaderResourceView> resolveSrv;
+  if (plan.resolve) {
+    source->GetDesc(&sourceDesc);
+    if (sourceDesc.Format != plan.sourceFormat
+        && sourceDesc.Format != presentCacheFormat(plan.sourceFormat)) {
+      if (!copyFormatsCompatible(sourceDesc.Format, plan.sourceFormat))
+        return DXGI_ERROR_UNSUPPORTED;
+      // MSAA Copy is a10.1 feature. A fully typed sRGB source on10.0
+      // needs a GPU shader resolve; PRESENT's typeless cache skips this path.
+      encodedShaderResolve = device->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_1;
+      if (encodedShaderResolve && (!(sourceDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+          || (sourceDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            && sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+          || !encodedResolveSampleCount(sourceDesc.SampleDesc.Count)
+          || sourceDesc.MipLevels != 1 || sourceDesc.ArraySize != 1 || sourceSubresource != 0
+          || sourceDesc.Width != plan.sourceWidth || sourceDesc.Height != plan.sourceHeight))
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+  }
+  if (encodedShaderResolve) {
+    // DXVK's internal mutable-format image admits an exact UNORM view of
+    // this bit layout. Ordinary fully typed native API images need not;
+    // they retain the original sRGB view and use bounded reconstruction.
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+    desc.Format = plan.sourceFormat; desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+    HRESULT viewHr = device->CreateShaderResourceView(source, &desc, &resolveSrv);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (viewHr == S_OK) { if (!resolveSrv) return E_FAIL; }
+    else {
+      if (viewHr != E_INVALIDARG && viewHr != DXGI_ERROR_UNSUPPORTED)
+        return FAILED(viewHr) ? viewHr : E_FAIL;
+      resolveSrv.Reset(); desc.Format = sourceDesc.Format;
+      viewHr = device->CreateShaderResourceView(source, &desc, &resolveSrv);
+      if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+      if (viewHr != S_OK) return FAILED(viewHr) ? viewHr : E_FAIL;
+      if (!resolveSrv) return E_FAIL;
+      decodedSrgbResolve = true;
+    }
+  }
+  std::vector<unsigned char> vsBytes, psBytes, resolveBytes;
+  if (!bltShaderContainers(vsBytes, psBytes)) return E_FAIL;
+  if (encodedShaderResolve && !encodedResolveShaderContainer(sourceDesc.SampleDesc.Count, resolveBytes, decodedSrgbResolve))
+    return E_FAIL;
+  ComPtr<ID3D11VertexShader> vs; ComPtr<ID3D11PixelShader> ps, resolvePs;
+  HRESULT hr = device->CreateVertexShader(vsBytes.data(), vsBytes.size(), nullptr, &vs);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  hr = device->CreatePixelShader(psBytes.data(), psBytes.size(), nullptr, &ps);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  if (encodedShaderResolve) {
+    hr = device->CreatePixelShader(resolveBytes.data(), resolveBytes.size(), nullptr, &resolvePs);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+    if (!resolvePs) return E_FAIL;
+  }
+  const D3D11_INPUT_ELEMENT_DESC elements[] = {
+    {inputRegisterSemantic, 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    {inputRegisterSemantic, 1, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  ComPtr<ID3D11InputLayout> layout;
+  hr = device->CreateInputLayout(elements, 2, vsBytes.data(), vsBytes.size(), &layout);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  const auto vertices = bltVertices(rotation);
+  D3D11_BUFFER_DESC vbDesc{}; vbDesc.ByteWidth = sizeof(vertices);
+  vbDesc.Usage = D3D11_USAGE_IMMUTABLE; vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA data{vertices.data(), 0, 0}; ComPtr<ID3D11Buffer> vb;
+  hr = device->CreateBuffer(&vbDesc, &data, &vb);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  D3D11_TEXTURE2D_DESC scratchDesc{};
+  scratchDesc.Width = plan.sourceWidth; scratchDesc.Height = plan.sourceHeight;
+  scratchDesc.MipLevels = scratchDesc.ArraySize = scratchDesc.SampleDesc.Count = 1;
+  scratchDesc.Format = plan.sourceFormat; scratchDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (encodedShaderResolve) scratchDesc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+  ComPtr<ID3D11Texture2D> sampled, rendered, encodedMultisample;
+  hr = device->CreateTexture2D(&scratchDesc, nullptr, &sampled);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  if (plan.resolve && !encodedShaderResolve) {
+    // Fully typed sRGB cannot ResolveSubresource under a UNORM format. Copy
+    // the same-family physical samples first; this changes no color values.
+    // PRESENT caches are already typeless and need no extra image.
+    if (sourceDesc.Format != plan.sourceFormat
+        && sourceDesc.Format != presentCacheFormat(plan.sourceFormat)) {
+      if (!copyFormatsCompatible(sourceDesc.Format, plan.sourceFormat))
+        return DXGI_ERROR_UNSUPPORTED;
+      auto encodedDesc = scratchDesc;
+      encodedDesc.SampleDesc = sourceDesc.SampleDesc;
+      encodedDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+      hr = device->CreateTexture2D(&encodedDesc, nullptr, &encodedMultisample);
+      if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+      if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+      if (!encodedMultisample) return E_FAIL;
+    }
+  }
+  scratchDesc.Width = plan.width; scratchDesc.Height = plan.height;
+  scratchDesc.Format = plan.destinationFormat; scratchDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  hr = device->CreateTexture2D(&scratchDesc, nullptr, &rendered);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  ComPtr<ID3D11ShaderResourceView> srv; ComPtr<ID3D11RenderTargetView> rtv;
+  ComPtr<ID3D11RenderTargetView> resolveRtv;
+  if (encodedShaderResolve) {
+    hr = device->CreateRenderTargetView(sampled.Get(), nullptr, &resolveRtv);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+    if (!resolveSrv || !resolveRtv) return E_FAIL;
+  }
+  hr = device->CreateShaderResourceView(sampled.Get(), nullptr, &srv);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  hr = device->CreateRenderTargetView(rendered.Get(), nullptr, &rtv);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  D3D11_SAMPLER_DESC samplerDesc{};
+  samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+  samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  samplerDesc.MaxAnisotropy = 1;
+  samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  ComPtr<ID3D11SamplerState> sampler;
+  hr = device->CreateSamplerState(&samplerDesc, &sampler);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  D3D11_RASTERIZER_DESC rasterDesc{};
+  rasterDesc.FillMode = D3D11_FILL_SOLID; rasterDesc.CullMode = D3D11_CULL_NONE;
+  rasterDesc.DepthClipEnable = TRUE; ComPtr<ID3D11RasterizerState> raster;
+  hr = device->CreateRasterizerState(&rasterDesc, &raster);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  ComPtr<ID3D11DeviceContext> commands;
+  hr = device->CreateDeferredContext(0, &commands);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  if (!vs || !ps || !layout || !vb || !sampled || !rendered || !srv || !rtv || !sampler || !raster || !commands)
+    return E_FAIL;
+  if (encodedMultisample) commands->CopySubresourceRegion(encodedMultisample.Get(), 0,
+    0, 0, 0, source, sourceSubresource, nullptr);
+  // UNORM interpretation averages encoded samples, never decoded colors.
+  if (encodedShaderResolve) {
+    ID3D11Buffer* resolveBuffers[] = {vb.Get()}; const UINT resolveStride = sizeof(BltVertex), resolveOffset = 0;
+    commands->IASetInputLayout(layout.Get()); commands->IASetVertexBuffers(0, 1, resolveBuffers, &resolveStride, &resolveOffset);
+    commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands->VSSetShader(vs.Get(), nullptr, 0); commands->PSSetShader(resolvePs.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* resolveViews[] = {resolveSrv.Get()};
+    commands->PSSetShaderResources(0, 1, resolveViews);
+    ID3D11RenderTargetView* resolveTargets[] = {resolveRtv.Get()}; commands->OMSetRenderTargets(1, resolveTargets, nullptr);
+    commands->RSSetState(raster.Get());
+    const D3D11_VIEWPORT resolveViewport{0, 0, FLOAT(plan.sourceWidth), FLOAT(plan.sourceHeight), 0, 1};
+    commands->RSSetViewports(1, &resolveViewport); commands->Draw(3, 0);
+    // Release the scratch output before binding that same image as an SRV.
+    commands->OMSetRenderTargets(0, nullptr, nullptr);
+    ID3D11ShaderResourceView* unbound[] = {nullptr}; commands->PSSetShaderResources(0, 1, unbound);
+  } else if (plan.resolve) commands->ResolveSubresource(sampled.Get(), 0,
+    encodedMultisample ? encodedMultisample.Get() : source,
+    encodedMultisample ? 0 : sourceSubresource, plan.sourceFormat);
+  else commands->CopySubresourceRegion(sampled.Get(), 0, 0, 0, 0, source, sourceSubresource, nullptr);
+  ID3D11Buffer* buffers[] = {vb.Get()}; const UINT stride = sizeof(BltVertex), offset = 0;
+  commands->IASetInputLayout(layout.Get()); commands->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
+  commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  commands->VSSetShader(vs.Get(), nullptr, 0); commands->PSSetShader(ps.Get(), nullptr, 0);
+  ID3D11ShaderResourceView* views[] = {srv.Get()}; ID3D11SamplerState* samplers[] = {sampler.Get()};
+  commands->PSSetShaderResources(0, 1, views); commands->PSSetSamplers(0, 1, samplers);
+  ID3D11RenderTargetView* targets[] = {rtv.Get()}; commands->OMSetRenderTargets(1, targets, nullptr);
+  commands->RSSetState(raster.Get());
+  const D3D11_VIEWPORT viewport{0, 0, FLOAT(plan.width), FLOAT(plan.height), 0, 1};
+  commands->RSSetViewports(1, &viewport); commands->Draw(3, 0);
+  commands->CopySubresourceRegion(destination, destinationSubresource, left, top, 0, rendered.Get(), 0, nullptr);
+  ComPtr<ID3D11CommandList> list;
+  hr = commands->FinishCommandList(FALSE, &list);
+  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  if (!list) return E_FAIL;
+  context->ExecuteCommandList(list.Get(), TRUE);
+  return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+}
+}

@@ -93,7 +93,6 @@
                     "shaderDrawParameters": true
                 },
                 "VkPhysicalDeviceVulkan12Features": {
-                    "storageBuffer8BitAccess": true,
                     "shaderInt8": true,
                     "descriptorIndexing" : true,
                     "descriptorBindingSampledImageUpdateAfterBind" : true,

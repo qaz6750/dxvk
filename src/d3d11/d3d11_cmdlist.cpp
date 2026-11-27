@@ -54,13 +54,12 @@ namespace dxvk {
   }
 
 
-  uint64_t D3D11CommandList::AddChunk(DxvkCsChunkRef&& Chunk, uint64_t Cost) {
+  void D3D11CommandList::AddChunk(DxvkCsChunkRef&& Chunk, uint64_t Cost) {
     m_chunks.emplace_back(std::move(Chunk), Cost);
-    return m_chunks.size() - 1;
   }
   
   
-  uint64_t D3D11CommandList::AddCommandList(
+  void D3D11CommandList::AddCommandList(
           D3D11CommandList*   pCommandList) {
     // This will be the chunk ID of the first chunk
     // added, for the purpose of resource tracking.
@@ -78,10 +77,6 @@ namespace dxvk {
 
       m_resources.push_back(std::move(entry));
     }
-
-    // Return ID of the last chunk added. The command list
-    // added can never be empty, so do not handle zero.
-    return m_chunks.size() - 1;
   }
 
 

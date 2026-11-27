@@ -19,6 +19,7 @@ namespace dxvk {
     VkInstance                instance        = VK_NULL_HANDLE;
     uint32_t                  extensionCount  = 0u;
     const char**              extensionNames  = nullptr;
+    Rc<vk::LibraryFn>         nativeDriverLibrary;
   };
 
 
@@ -197,6 +198,7 @@ namespace dxvk {
     Config                    m_config;
     DxvkOptions               m_options;
 
+    bool                      m_nativeDriver = false;
     Rc<vk::LibraryFn>         m_vkl = nullptr;
     Rc<vk::InstanceFn>        m_vki = nullptr;
 

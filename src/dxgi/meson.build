@@ -1,4 +1,6 @@
-dxgi_res = wrc_generator.process('version.rc')
+module_name = qcdx_apps ? 'qcdx_dxvk_dxgi' : dxvk_name_prefix + 'dxgi'
+qcdx_rc_args = qcdx_apps ? [rc_define + 'DXVK_DLL_NAME="' + module_name + '.dll"'] : []
+dxgi_res = wrc_generator.process('version.rc', extra_args : qcdx_rc_args)
 
 dxgi_src = [
   'dxgi_adapter.cpp',
@@ -24,7 +26,7 @@ else
   dxgi_link_depends += files('dxgi.sym')
 endif
 
-dxgi_dll = shared_library(dxvk_name_prefix+'dxgi', dxgi_src, dxgi_res,
+dxgi_dll = shared_library(module_name, dxgi_src, dxgi_res,
   dependencies        : [ dxvk_dep, dxgi_extra_dep ],
   include_directories : dxvk_include_path,
   install             : true,

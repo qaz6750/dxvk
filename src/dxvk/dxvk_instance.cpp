@@ -27,11 +27,13 @@ namespace dxvk {
     Logger::info(str::format("DXVK: ", DXVK_VERSION));
     Logger::info(str::format("Build: ", DXVK_TARGET, " ", DXVK_COMPILER, " ", DXVK_COMPILER_VERSION));
 
-    wsi::init();
-
-    m_config = Config::getUserConfig();
-    m_config.merge(Config::getAppConfig(env::getExePath()));
-    m_config.logOptions();
+    m_nativeDriver = args.nativeDriverLibrary != nullptr;
+    if (!m_nativeDriver) {
+      wsi::init();
+      m_config = Config::getUserConfig();
+      m_config.merge(Config::getAppConfig(env::getExePath()));
+      m_config.logOptions();
+    }
 
     m_options = DxvkOptions(m_config);
 
@@ -40,11 +42,13 @@ namespace dxvk {
       throw DxvkError("Failed to load vulkan-1 library.");
 
     // Initialize extension providers
-    m_extProviders.push_back(&DxvkPlatformExts::s_instance);
+    if (!m_nativeDriver) {
+      m_extProviders.push_back(&DxvkPlatformExts::s_instance);
 #ifdef _WIN32
-    m_extProviders.push_back(&VrInstance::s_instance);
-    m_extProviders.push_back(&DxvkXrProvider::s_instance);
+      m_extProviders.push_back(&VrInstance::s_instance);
+      m_extProviders.push_back(&DxvkXrProvider::s_instance);
 #endif
+    }
 
     Logger::info("Extension providers:");
 
@@ -65,7 +69,8 @@ namespace dxvk {
     if (m_messenger)
       m_vki->vkDestroyDebugUtilsMessengerEXT(m_vki->instance(), m_messenger, nullptr);
 
-    wsi::quit();
+    if (!m_nativeDriver)
+      wsi::quit();
   }
   
   
@@ -102,6 +107,10 @@ namespace dxvk {
   
   
   bool DxvkInstance::initVulkanLoader(const DxvkInstanceImportInfo& args) {
+    if (args.nativeDriverLibrary) {
+      m_vkl = args.nativeDriverLibrary;
+      return true;
+    }
     m_vkl = args.loaderProc
       ? new vk::LibraryFn(args.loaderProc)
       : new vk::LibraryFn();
@@ -346,6 +355,9 @@ namespace dxvk {
     }
 
     if (m_adapters.empty()) {
+      if (m_nativeDriver)
+        return true; // The native DDI reports the missing adapter by LUID.
+
       Logger::warn(str::format(
         "DXVK: No adapters found. Please check your device filter settings\n"
         "and Vulkan drivers. A Vulkan ",

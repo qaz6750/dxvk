@@ -1,4 +1,3 @@
-LIBRARY DXGI.DLL
 EXPORTS  
     CreateDXGIFactory @9
     CreateDXGIFactory1 @10

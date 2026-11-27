@@ -19,6 +19,9 @@ namespace dxvk {
     friend class D3D11VideoContext;
     friend class D3D11DXGIKeyedMutex;
   public:
+    HRESULT IsStagingResourceBusy(ID3D11Resource* resource, BOOL* busy);
+    HRESULT FlushRuntimeSubmission();
+
     
     D3D11ImmediateContext(
             D3D11Device*    pParent,

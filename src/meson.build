@@ -1,3 +1,9 @@
+qcdx_apps = get_option('qcdx_app_dlls')
+rc_define = dxvk_is_msvc ? '/D' : '-D'
+if qcdx_apps and platform != 'windows'
+  error('Versioned qcdx application DLLs require a Windows target')
+endif
+
 subdir('wsi')
 subdir('util')
 subdir('spirv')
@@ -36,4 +42,11 @@ endif
 # Nothing selected
 if not get_option('enable_d3d8') and not get_option('enable_d3d9') and not get_option('enable_dxgi')
   warning('Nothing selected to be built.?')
+endif
+
+if get_option('enable_qcdx_umd')
+  if platform != 'windows' or not get_option('enable_d3d11')
+    error('The qcdx UMD requires Windows and D3D11')
+  endif
+  subdir('umd')
 endif

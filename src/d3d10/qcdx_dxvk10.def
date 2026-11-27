@@ -1,0 +1,8 @@
+EXPORTS
+    D3D10CoreCreateDevice
+    D3D10CoreGetVersion
+    D3D10CoreRegisterLayers
+    D3D10CreateDevice
+    D3D10CreateDevice1
+    D3D10CreateDeviceAndSwapChain
+    D3D10CreateDeviceAndSwapChain1

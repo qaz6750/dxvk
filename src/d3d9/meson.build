@@ -1,4 +1,6 @@
-d3d9_res = wrc_generator.process('version.rc')
+module_name = qcdx_apps ? 'qcdx_dxvk9' : dxvk_name_prefix + 'd3d9'
+qcdx_rc_args = qcdx_apps ? [rc_define + 'DXVK_DLL_NAME="' + module_name + '.dll"'] : []
+d3d9_res = wrc_generator.process('version.rc', extra_args : qcdx_rc_args)
 
 d3d9_shaders = files([
   'shaders/d3d9_convert_yuy2_uyvy.comp',
@@ -60,7 +62,7 @@ if platform != 'windows'
   d3d9_link_depends += files('d3d9.sym')
 endif
 
-d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
+d3d9_dll = shared_library(module_name, d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
   dependencies        : [ dxbc_spirv_dep, dxvk_dep ],
   include_directories : dxvk_include_path,
   install             : true,

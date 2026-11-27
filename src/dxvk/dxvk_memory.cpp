@@ -1549,6 +1549,7 @@ namespace dxvk {
     // a smaller size until we reach a point where we cannot service the
     // allocation.
     DxvkDeviceMemory chunk = { };
+    desiredSize = std::min(desiredSize, m_device->properties().vk11.maxMemoryAllocationSize);
 
     while (!chunk.memory && desiredSize >= std::max(requiredSize, DxvkMemoryPool::MinChunkSize)) {
       chunk = allocateDeviceMemory(type, desiredSize, nullptr);

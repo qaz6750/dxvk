@@ -1,5 +1,9 @@
 #include <windows.h>
 
+#ifndef DXVK_DLL_NAME
+#define DXVK_DLL_NAME "D3D8.dll"
+#endif
+
 // DLL version information.
 VS_VERSION_INFO    VERSIONINFO
 FILEVERSION        10,0,17763,1
@@ -17,9 +21,9 @@ BEGIN
       VALUE "CompanyName",      "DXVK"
       VALUE "FileDescription",  "Direct3D 8 Runtime"
       VALUE "FileVersion",      "10.0.17763.1 (WinBuild.160101.0800)"
-      VALUE "InternalName",     "D3D8.dll"
+      VALUE "InternalName",     DXVK_DLL_NAME
       VALUE "LegalCopyright",   "zlib/libpng license"
-      VALUE "OriginalFilename", "D3D8.dll"
+      VALUE "OriginalFilename", DXVK_DLL_NAME
       VALUE "ProductName",      "DXVK"
       VALUE "ProductVersion",   "10.0.17763.1"
     END

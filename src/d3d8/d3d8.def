@@ -1,4 +1,3 @@
-LIBRARY D3D8.DLL
 EXPORTS
   ValidatePixelShader @ 2
   ValidateVertexShader @ 3

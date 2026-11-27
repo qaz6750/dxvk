@@ -6,6 +6,10 @@
 #include "../util/util_misc.h"
 #include "../util/util_win32_compat.h"
 
+#ifndef DXVK_D3D9_MODULE
+#define DXVK_D3D9_MODULE "d3d9.dll"
+#endif
+
 namespace dxvk {
 
   template <bool Register>
@@ -14,7 +18,7 @@ namespace dxvk {
     static const int16_t RegisterOrdinal = 28257;
     static const int16_t UnregisterOrdinal = 28258;
 
-    HMODULE d3d9Module = ::LoadLibraryA("d3d9.dll");
+    HMODULE d3d9Module = ::LoadLibraryA(DXVK_D3D9_MODULE);
     if (!d3d9Module) {
       Logger::info("Unable to find d3d9, some annotations may be missed.");
       return;

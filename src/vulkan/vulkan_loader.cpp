@@ -48,7 +48,8 @@ namespace dxvk::vk {
     std::tie(m_library, m_getInstanceProcAddr) = loadVulkanLibrary();
   }
 
-  LibraryLoader::LibraryLoader(PFN_vkGetInstanceProcAddr loaderProc) {
+  LibraryLoader::LibraryLoader(PFN_vkGetInstanceProcAddr loaderProc, HMODULE ownedModule) {
+    m_library = ownedModule;
     m_getInstanceProcAddr = loaderProc;
   }
 
@@ -88,8 +89,8 @@ namespace dxvk::vk {
   
   
   LibraryFn::LibraryFn() { }
-  LibraryFn::LibraryFn(PFN_vkGetInstanceProcAddr loaderProc)
-  : LibraryLoader(loaderProc) { }
+  LibraryFn::LibraryFn(PFN_vkGetInstanceProcAddr loaderProc, HMODULE ownedModule)
+  : LibraryLoader(loaderProc, ownedModule) { }
   LibraryFn::~LibraryFn() { }
   
   

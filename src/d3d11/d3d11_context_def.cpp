@@ -159,7 +159,7 @@ namespace dxvk {
     // Record any chunks from the given command list into the
     // current command list and deal with context state
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
-    m_chunkId = m_commandList->AddCommandList(commandList);
+    m_commandList->AddCommandList(commandList);
     
     // Restore deferred context state
     if (RestoreContextState)
@@ -193,7 +193,6 @@ namespace dxvk {
     // Any use of ExecuteCommandList will reset command list state
     // before the command list is actually executed.
     m_commandList = CreateCommandList();
-    m_chunkId = 0;
     
     if (RestoreDeferredContextState)
       RestoreCommandListState();
@@ -396,13 +395,16 @@ namespace dxvk {
   
   
   void D3D11DeferredContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
-    m_chunkId = m_commandList->AddChunk(std::move(chunk), m_estimatedCost);
+    m_commandList->AddChunk(std::move(chunk), m_estimatedCost);
     m_estimatedCost = 0u;
   }
 
 
   uint64_t D3D11DeferredContext::GetCurrentChunkId() const {
-    return m_csChunk->empty() ? m_chunkId : m_chunkId + 1;
+    // The active chunk follows the chunks already appended to the list.
+    // If the command filled its chunk, it was appended before tracking.
+    const auto count = m_commandList->GetChunkCount();
+    return m_csChunk->empty() && count ? count - 1 : count;
   }
 
 

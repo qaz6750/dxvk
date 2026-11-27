@@ -8,6 +8,11 @@
 #endif
 
 #include <stdint.h>
+#ifdef DXVK_BUNDLED_D3D8
+#include <windows.h>
+using WINBOOL = BOOL;
+#define __MSABI_LONG(value) value##L
+#endif
 #include <d3d8.h>
 
 // Declare __uuidof for D3D8 interfaces
@@ -50,7 +55,7 @@ interface DECLSPEC_UUID("4B8AAAFA-140F-42BA-9131-597EAFAA2EAD") IDirect3DVolumeT
 #undef D3DSP_REGNUM_MASK    // changed from 0x00000FFF to 0x000007FF in D3D9
 
 
-#if defined(__MINGW32__) || defined(__GNUC__)
+#if defined(__MINGW32__) || defined(__GNUC__) || defined(DXVK_BUNDLED_D3D8)
 
 // Avoid redundant definitions (add D3D*_DEFINED macros here)
 #define D3DRECT_DEFINED
@@ -81,7 +86,7 @@ namespace d3d9 {
 #define DXVK_D3D9_NAMESPACE
 
 
-#if defined(__MINGW32__) || defined(__GNUC__)
+#if defined(__MINGW32__) || defined(__GNUC__) || defined(DXVK_BUNDLED_D3D8)
 #pragma pop_macro("__CRT_UUID_DECL")
 
 // Declare __uuidof for D3D9 interfaces, directly within the d3d9:: namespace
@@ -190,8 +195,8 @@ __CRT_UUID_DECL(d3d9::IDirect3DDevice9Ex,          0xB18B10CE, 0x2649, 0x405A, 0
 #define D3DDEVINFOID_VCACHE               4
 #endif
 
-// MinGW headers are broken. Who'dve guessed?
-#ifndef _MSC_VER
+// Supply definitions absent from Wine/MinGW D3D8 headers.
+#if !defined(_MSC_VER) || defined(DXVK_BUNDLED_D3D8)
 
 // Missing from d3d8types.h
 #ifndef D3DDEVINFOID_RESOURCEMANAGER

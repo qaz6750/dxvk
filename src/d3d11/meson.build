@@ -1,4 +1,6 @@
-d3d11_res = wrc_generator.process('version.rc')
+module_name = qcdx_apps ? 'qcdx_dxvk11' : dxvk_name_prefix + 'd3d11'
+qcdx_rc_args = qcdx_apps ? [rc_define + 'DXVK_DLL_NAME="' + module_name + '.dll"'] : []
+d3d11_res = wrc_generator.process('version.rc', extra_args : qcdx_rc_args)
 
 dxgi_common_src = [
   '../dxgi/dxgi_format.cpp',
@@ -41,7 +43,6 @@ d3d11_src = [
   'd3d11_initializer.cpp',
   'd3d11_input_layout.cpp',
   'd3d11_interop.cpp',
-  'd3d11_main.cpp',
   'd3d11_on_12.cpp',
   'd3d11_options.cpp',
   'd3d11_query.cpp',
@@ -72,15 +73,16 @@ d3d11_ld_args      = []
 d3d11_link_depends = []
 
 if platform == 'windows'
-  d3d11_dxgi_deps = [ lib_gdi32, lib_dxgi ]
+  d3d11_dxgi_deps = [ lib_gdi32, qcdx_apps ? dxgi_dep : lib_dxgi ]
 else
   d3d11_ld_args      += [ '-Wl,--version-script', join_paths(meson.current_source_dir(), 'd3d11.sym') ]
   d3d11_link_depends += files('d3d11.sym')
   d3d11_dxgi_deps = [ dxgi_dep ]
 endif
 
-d3d11_dll = shared_library(dxvk_name_prefix+'d3d11', dxgi_common_src + d3d11_src + d3d10_src,
+d3d11_dll = shared_library(module_name, dxgi_common_src + d3d11_src + d3d10_src + ['d3d11_main.cpp'],
     glsl_generator.process(d3d11_shaders), d3d11_res,
+  cpp_args            : qcdx_apps ? ['-DDXVK_D3D9_MODULE="qcdx_dxvk9.dll"'] : [],
   dependencies        : d3d11_dxgi_deps + [ dxvk_dep, dxbc_spirv_dep ],
   include_directories : dxvk_include_path,
   install             : true,
@@ -100,4 +102,8 @@ if platform != 'windows'
     filebase: dxvk_pkg_prefix + 'd3d11',
     subdirs:  'dxvk',
   )
+endif
+
+if get_option('enable_qcdx_umd')
+  qcdx_d3d11_objects = d3d11_dll.extract_objects(dxgi_common_src + d3d11_src + d3d10_src)
 endif

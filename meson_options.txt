@@ -9,3 +9,6 @@ option('native_sdl2',  type : 'feature', value : 'auto', description: 'Enable SD
 option('native_xcb',  type : 'feature', value : 'auto', description: 'Enable XCB WSI for DXVK Native')
 option('native_wayland',  type : 'feature', value : 'auto', description: 'Enable Wayland WSI for DXVK Native')
 option('native_sdl3',  type : 'feature', value : 'auto', description: 'Enable SDL3 WSI for DXVK Native')
+
+option('enable_qcdx_umd', type : 'boolean', value : false, description : 'Build the native qcdx WDDM D3D11 driver')
+option('qcdx_app_dlls', type : 'boolean', value : false, description : 'Build versioned qcdx DXVK application DLLs on Windows')

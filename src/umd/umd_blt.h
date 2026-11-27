@@ -74,7 +74,12 @@ inline HRESULT bltPlan(const D3D11_TEXTURE2D_DESC& src,
       || staged.height != (swapped ? staged.sourceWidth : staged.sourceHeight))) return E_INVALIDARG;
   // Same-layout sRGB/UNORM casts also preserve encoded bits and physical X.
   // Conversion permission above is still mandatory for different formats.
-  staged.directCopy = rotation == 1 && !(flags & 5) && staged.sourceFormat == staged.destinationFormat
+  // DWM may set Stretch for a 1:1 rectangle. Sampling texel centers is an
+  // identity for identical UNORM color formats. Keep the shader's explicit
+  // alpha-one result for stretched X8 images and its format conversions.
+  const bool copyStretch = src.Format == dst.Format && !presentX8Format(src.Format);
+  staged.directCopy = rotation == 1 && !staged.resolve && (!(flags & 4) || copyStretch)
+    && staged.sourceFormat == staged.destinationFormat
     && staged.sourceWidth == staged.width && staged.sourceHeight == staged.height;
   output = staged;
   return S_OK;

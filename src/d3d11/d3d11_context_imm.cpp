@@ -388,7 +388,7 @@ namespace dxvk {
 
   HRESULT D3D11ImmediateContext::FlushRuntimeSubmission() {
     D3D10DeviceLock lock = LockContext();
-    EmitCs<false>([](DxvkContext*) { });
+    m_parent->FlushInitCommands();
     ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
     return m_parent->GetDeviceRemovedReason();
   }
@@ -995,6 +995,7 @@ namespace dxvk {
     // Do not update the sequence number when emitting a chunk
     // from an external source since that would break tracking
     m_csThread.injectChunk(Queue, std::move(Chunk), Synchronize);
+    m_injectedChunks.fetch_add(1, std::memory_order_release);
   }
 
 
@@ -1152,8 +1153,10 @@ namespace dxvk {
           GpuFlushType                FlushType,
           HANDLE                      hEvent,
           BOOL                        Synchronize) {
-    // Exit early if there's nothing to do
-    if (!GetPendingCsChunks() && !hEvent) {
+    // Resource initialization can enqueue work independently of the ordered
+    // context. Only acknowledge injections already queued before this flush.
+    const uint64_t injected = m_injectedChunks.load(std::memory_order_acquire);
+    if (!GetPendingCsChunks() && injected == m_flushedInjections && !hEvent) {
       if (Synchronize)
         m_device->waitForSubmission(m_submissionId);
       return;
@@ -1195,6 +1198,7 @@ namespace dxvk {
     FlushCsChunk();
 
     // Notify flush tracker about the flush
+    m_flushedInjections = injected;
     m_flushSeqNum = m_csSeqNum;
     m_flushTracker.notifyFlush(m_flushSeqNum, submissionId);
 

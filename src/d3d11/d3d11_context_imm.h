@@ -124,6 +124,8 @@ namespace dxvk {
     
     DxvkCsThread            m_csThread;
     uint64_t                m_csSeqNum = 0ull;
+    std::atomic<uint64_t>   m_injectedChunks{0};
+    uint64_t                m_flushedInjections = 0;
 
     uint32_t                m_mappedImageCount = 0u;
 

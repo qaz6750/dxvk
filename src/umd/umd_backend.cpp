@@ -9,6 +9,30 @@ Logger Logger::s_instance("");
 }
 
 namespace dxvk::umd {
+HRESULT createSharedTexture(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& desc,
+                            const D3D11_SUBRESOURCE_DATA* data, ID3D11Texture2D** texture) {
+  D3D11_TEXTURE2D_DESC1 extended = {desc.Width, desc.Height, desc.MipLevels, desc.ArraySize,
+    desc.Format, desc.SampleDesc, desc.Usage, desc.BindFlags, desc.CPUAccessFlags, desc.MiscFlags,
+    D3D11_TEXTURE_LAYOUT_UNDEFINED};
+  ID3D11Texture2D1* result = nullptr;
+  HRESULT hr = static_cast<D3D11Device*>(device)->CreateTexture2DBase(&extended, data, &result, true);
+  if (hr != S_OK)
+    return device->CreateTexture2D(&desc, data, texture);
+  *texture = result;
+  return S_OK;
+}
+
+bool hasSharedImageMapping(ID3D11Texture2D* texture) {
+  auto common = GetCommonTexture(texture);
+  return common->Desc()->PreferMappedTransfer && common->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT;
+}
+
+HRESULT getSharedImageMapping(ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+                              bool read, D3D11_MAPPED_SUBRESOURCE* mapping) noexcept {
+  try { return static_cast<D3D11ImmediateContext*>(context)->GetSharedImageMapping(texture, read, mapping); }
+  catch (...) { return DXGI_ERROR_DEVICE_REMOVED; }
+}
+
 HRESULT getAttachmentFormatSupport(ID3D11Device* device, DXGI_FORMAT format,
                                    UINT* support, UINT* sampleCounts) {
   return static_cast<D3D11Device*>(device)->GetFormatSupportFlags(format, support, nullptr, sampleCounts);

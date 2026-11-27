@@ -386,6 +386,28 @@ namespace dxvk {
     return S_OK;
   }
 
+  HRESULT D3D11ImmediateContext::GetSharedImageMapping(ID3D11Texture2D* resource,
+          bool read, D3D11_MAPPED_SUBRESOURCE* mapping) {
+    D3D10DeviceLock lock = LockContext();
+    auto texture = GetCommonTexture(resource);
+    if (!texture->Desc()->PreferMappedTransfer || texture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
+      return E_INVALIDARG;
+
+    m_parent->FlushInitCommands();
+    ExecuteFlush(GpuFlushType::ImplicitSynchronization, nullptr, false);
+    m_device->pollCompletions();
+    if (!WaitForResource(*texture->GetImage(), DxvkCsThread::SynchronizeAll,
+                         read ? D3D11_MAP_READ : D3D11_MAP_WRITE, 0))
+      return DXGI_ERROR_WAS_STILL_DRAWING;
+    HRESULT hr = m_parent->GetDeviceRemovedReason();
+    if (FAILED(hr)) return hr;
+    auto layout = texture->GetSubresourceLayout(VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    mapping->pData = texture->GetMapPtr(0, layout.Offset);
+    mapping->RowPitch = layout.RowPitch;
+    mapping->DepthPitch = layout.DepthPitch;
+    return S_OK;
+  }
+
   HRESULT D3D11ImmediateContext::FlushRuntimeSubmission() {
     D3D10DeviceLock lock = LockContext();
     m_parent->FlushInitCommands();

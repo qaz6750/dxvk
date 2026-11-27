@@ -89,7 +89,8 @@ namespace dxvk {
     HRESULT STDMETHODCALLTYPE CreateTexture2DBase(
       const D3D11_TEXTURE2D_DESC1*  pDesc,
       const D3D11_SUBRESOURCE_DATA* pInitialData,
-            ID3D11Texture2D1**      ppTexture2D);
+            ID3D11Texture2D1**      ppTexture2D,
+            bool                    preferMappedTransfer = false);
     
     HRESULT STDMETHODCALLTYPE CreateTexture3D(
       const D3D11_TEXTURE3D_DESC*   pDesc,

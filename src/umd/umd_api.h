@@ -13,6 +13,11 @@ inline constexpr D3D_FEATURE_LEVEL implementationFeatureLevel(D3D_FEATURE_LEVEL 
 }
 HRESULT createDevice(const LUID& luid, D3D_FEATURE_LEVEL level, bool disableExtraThreads,
                      ID3D11Device** device, ID3D11DeviceContext** context) noexcept;
+HRESULT createSharedTexture(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& desc,
+                            const D3D11_SUBRESOURCE_DATA* data, ID3D11Texture2D** texture);
+bool hasSharedImageMapping(ID3D11Texture2D* texture);
+HRESULT getSharedImageMapping(ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+                              bool read, D3D11_MAPPED_SUBRESOURCE* mapping) noexcept;
 // Query the same Vulkan attachment limits used to build the format support flags.
 HRESULT getAttachmentFormatSupport(ID3D11Device* device, DXGI_FORMAT format,
                                    UINT* support, UINT* sampleCounts);

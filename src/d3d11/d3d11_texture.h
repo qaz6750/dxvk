@@ -51,6 +51,7 @@ namespace dxvk {
     UINT             CPUAccessFlags;
     UINT             MiscFlags;
     D3D11_TEXTURE_LAYOUT TextureLayout;
+    bool             PreferMappedTransfer = false;
   };
 
 

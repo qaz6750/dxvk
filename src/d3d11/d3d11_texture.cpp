@@ -176,6 +176,8 @@ namespace dxvk {
     // to enable linear tiling, and DXVK needs to be aware that
     // the image can be accessed by the host.
     if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT) {
+      if (m_desc.PreferMappedTransfer)
+        imageInfo.shared = VK_TRUE; // Materialize pending clears and restore GENERAL at submission.
       imageInfo.tiling        = VK_IMAGE_TILING_LINEAR;
       imageInfo.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
 
@@ -183,7 +185,7 @@ namespace dxvk {
         imageInfo.stages |= VK_PIPELINE_STAGE_HOST_BIT;
         imageInfo.access |= VK_ACCESS_HOST_READ_BIT;
 
-        if (pDesc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE)
+        if (m_desc.PreferMappedTransfer || (pDesc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE))
           imageInfo.access |= VK_ACCESS_HOST_WRITE_BIT;
       }
     }
@@ -558,6 +560,26 @@ namespace dxvk {
   std::pair<D3D11_COMMON_TEXTURE_MAP_MODE, VkMemoryPropertyFlags> D3D11CommonTexture::DetermineMapMode(
     const D3D11Device*          device,
     const DxvkImageCreateInfo*  pImageInfo) const {
+    // The native UMD transfers single-sample color surfaces at ownership
+    // boundaries. Check the typed views too before choosing linear storage.
+    if (m_desc.PreferMappedTransfer && !device->GetOptions()->disableDirectImageMapping
+     && m_desc.Usage == D3D11_USAGE_DEFAULT && !m_desc.CPUAccessFlags && !m_desc.MiscFlags
+     && !(m_desc.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET))
+     && m_desc.SampleDesc.Count == 1 && m_desc.MipLevels == 1 && m_desc.ArraySize == 1
+     && m_packedFormat == pImageInfo->format
+     && lookupFormatInfo(m_packedFormat)->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+     && CheckImageSupport(pImageInfo, VK_IMAGE_TILING_LINEAR)) {
+      bool supported = true;
+      for (uint32_t i = 0; i < pImageInfo->viewFormatCount && supported; ++i) {
+        auto view = *pImageInfo;
+        view.format = pImageInfo->viewFormats[i];
+        supported = CheckImageSupport(&view, VK_IMAGE_TILING_LINEAR);
+      }
+      if (supported)
+        return { D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT };
+    }
+
     // Don't map an image unless the application requests it
     if (!m_desc.CPUAccessFlags)
       return { D3D11_COMMON_TEXTURE_MAP_MODE_NONE, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT };

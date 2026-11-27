@@ -21,6 +21,8 @@ namespace dxvk {
   public:
     HRESULT IsStagingResourceBusy(ID3D11Resource* resource, BOOL* busy);
     HRESULT FlushRuntimeSubmission();
+    HRESULT GetSharedImageMapping(ID3D11Texture2D* texture, bool read,
+                                  D3D11_MAPPED_SUBRESOURCE* mapping);
 
     
     D3D11ImmediateContext(

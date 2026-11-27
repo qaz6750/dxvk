@@ -217,7 +217,8 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11Device::CreateTexture2DBase(
     const D3D11_TEXTURE2D_DESC1*  pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
-          ID3D11Texture2D1**      ppTexture2D) {
+          ID3D11Texture2D1**      ppTexture2D,
+          bool                    preferMappedTransfer) {
     D3D11_COMMON_TEXTURE_DESC desc;
     desc.Width          = pDesc->Width;
     desc.Height         = pDesc->Height;
@@ -231,6 +232,7 @@ namespace dxvk {
     desc.CPUAccessFlags = pDesc->CPUAccessFlags;
     desc.MiscFlags      = pDesc->MiscFlags;
     desc.TextureLayout  = pDesc->TextureLayout;
+    desc.PreferMappedTransfer = preferMappedTransfer;
     
     HRESULT hr = D3D11CommonTexture::NormalizeTextureProperties(&desc);
 

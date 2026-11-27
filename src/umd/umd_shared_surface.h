@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "umd_allocation.h"
 #include "umd_shared_policy.h"
+#include "umd_private_transfer.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <cstdint>
@@ -46,17 +47,10 @@ inline HRESULT sharedStaging(ID3D11Device* device, SharedSurface& surface) {
 // cannot read/write STAGING, and the synchronized Map is our completion barrier.
 inline HRESULT copySharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
     ID3D11Texture2D* destination, ID3D11Texture2D* source) {
-  using Microsoft::WRL::ComPtr;
   if (!device || !context || !source || !destination
       || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return E_INVALIDARG;
-  // Copy on the immediate context that will Map the staging resource. This
-  // keeps readback ordering local and avoids a command list per handoff.
-  ComPtr<ID3D11Predicate> predicate;
-  BOOL value = FALSE;
-  context->GetPredication(&predicate, &value);
-  if (predicate) context->SetPredication(nullptr, FALSE);
+  UnpredicatedTransfer transfer(context);
   context->CopyResource(destination, source);
-  if (predicate) context->SetPredication(predicate.Get(), value);
   return device->GetDeviceRemovedReason();
 }
 

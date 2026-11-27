@@ -170,11 +170,16 @@ HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, void* data, UINT pitch, 
     auto host = static_cast<unsigned char*>(data);
     auto vidmm = static_cast<unsigned char*>(map.pData);
     const auto& layout = binding->layout;
-    for (UINT y = 0; y < layout.height; ++y) {
-      auto src = host + size_t(y)*pitch;
-      auto dst = vidmm + size_t(y)*layout.pitch;
-      if (publish) std::memcpy(dst, src, rowBytes(layout));
-      else std::memcpy(src, dst, rowBytes(layout));
+    const auto bytes = rowBytes(layout);
+    auto src = publish ? host : vidmm;
+    auto dst = publish ? vidmm : host;
+    if (pitch == bytes && layout.pitch == bytes) {
+      std::memcpy(dst, src, size_t(bytes) * layout.height);
+    } else {
+      const auto srcPitch = publish ? pitch : layout.pitch;
+      const auto dstPitch = publish ? layout.pitch : pitch;
+      for (UINT y = 0; y < layout.height; ++y)
+        std::memcpy(dst + size_t(y) * dstPitch, src + size_t(y) * srcPitch, bytes);
     }
   } else hr = E_FAIL;
   D3DDDICB_UNLOCK2 unlock = {};

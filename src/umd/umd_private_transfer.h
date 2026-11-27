@@ -5,6 +5,24 @@
 
 namespace dxvk::umd {
 
+// Copy and resolve commands do not change pipeline bindings. Suspend the
+// application's predicate while issuing internal transfers on its context.
+class UnpredicatedTransfer {
+public:
+  explicit UnpredicatedTransfer(ID3D11DeviceContext* context) : context(context) {
+    context->GetPredication(&predicate, &value);
+    if (predicate) context->SetPredication(nullptr, FALSE);
+  }
+  ~UnpredicatedTransfer() {
+    if (predicate) context->SetPredication(predicate.Get(), value);
+  }
+
+private:
+  ID3D11DeviceContext* context;
+  Microsoft::WRL::ComPtr<ID3D11Predicate> predicate;
+  BOOL value = FALSE;
+};
+
 // Internal ownership/readback work must run independently of application
 // predication and pipeline bindings. Keep the owner's pins and reentrant live
 // checks at the call site; only a complete live list may enter the GPU stream.

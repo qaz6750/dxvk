@@ -1565,7 +1565,11 @@ void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstInd
     device->error(E_INVALIDARG); return;
   }
   if (!readSharedSurface(device, get(src)->shared)) return;
-  if (!wroteSharedRegion(device, get(dst)->shared)) return;
+  const bool replacesDestination = !x && !y && !z
+    && box.right - box.left == destination.width && box.bottom - box.top == destination.height
+    && box.back - box.front == destination.depth;
+  if (replacesDestination) wroteSharedSurface(device, get(dst)->shared);
+  else if (!wroteSharedRegion(device, get(dst)->shared)) return;
   try {
     if (source.dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D
         && source.format != destination.format
@@ -1624,13 +1628,10 @@ void APIENTRY updateResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT in
   if (!source || !validSpan) {
     device->error(E_INVALIDARG); return;
   }
-  // Without a box the update replaces the whole subresource; with one it does
-  // not, and the untouched pixels are still the other process's.
-  if (input) {
-    if (!wroteSharedRegion(device, get(dst)->shared)) return;
-  } else {
-    wroteSharedSurface(device, get(dst)->shared);
-  }
+  const bool replacesDestination = !box.left && !box.top && !box.front
+    && box.right == destination.width && box.bottom == destination.height && box.back == destination.depth;
+  if (replacesDestination) wroteSharedSurface(device, get(dst)->shared);
+  else if (!wroteSharedRegion(device, get(dst)->shared)) return;
   try {
     device->context->UpdateSubresource(get(dst)->backend.Get(), index, input ? &box : nullptr,
       source, rowPitch, depthPitch);
@@ -2970,16 +2971,17 @@ HRESULT publishPresentData(Device* device, DXGI_DDI_HRESOURCE storage, bool prim
       if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
       if (!resolved) return E_FAIL;
     }
-    hr = dxvk::umd::submitPrivateTransfer(backend.Get(), context.Get(), stillLive,
-      [&](ID3D11DeviceContext* commands) -> HRESULT {
-        if (resolved) {
-          commands->ResolveSubresource(resolved.Get(), 0, source.Get(), 0, dxvk::umd::bltLinearFormat(format));
-          if (!stillLive()) return DXGI_ERROR_DEVICE_REMOVED;
-        }
-        commands->CopyResource(readback.Get(), resolved ? resolved.Get() : source.Get());
-        return stillLive() ? S_OK : DXGI_ERROR_DEVICE_REMOVED;
-      });
-    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+    {
+      dxvk::umd::UnpredicatedTransfer transfer(context.Get());
+      if (resolved) {
+        context->ResolveSubresource(resolved.Get(), 0, source.Get(), 0, dxvk::umd::bltLinearFormat(format));
+        if (!stillLive()) return DXGI_ERROR_DEVICE_REMOVED;
+      }
+      context->CopyResource(readback.Get(), resolved ? resolved.Get() : source.Get());
+    }
+    if (!stillLive()) return DXGI_ERROR_DEVICE_REMOVED;
+    hr = backend->GetDeviceRemovedReason();
+    if (FAILED(hr)) return hr;
     D3D11_MAPPED_SUBRESOURCE map = {};
     // Synchronous Map is the GPU completion barrier before any guest CPU
     // publication. Correctness checkpoint; this is not a zero-copy path.

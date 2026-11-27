@@ -1,6 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 #include "umd_blt_shader.h"
+#include "umd_private_transfer.h"
 #include "umd_encoded_resolve_shader.h"
 #include "umd_present_format.h"
 #include <d3d11.h>
@@ -95,21 +96,10 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
     // operation is already complete. Never issue an illegal self-copy.
     if (source == destination && sourceSubresource == destinationSubresource)
       return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
-    ComPtr<ID3D11DeviceContext> commands;
-    HRESULT hr = device->CreateDeferredContext(0, &commands);
     if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
-    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
-    if (!commands) return E_FAIL;
-    // A fresh context has no app predication or bindings. The GPU bit copy
-    // preserves all physical channels, including X8, without SRV/RTV sampling.
-    commands->CopySubresourceRegion(destination, destinationSubresource, left, top, 0,
+    UnpredicatedTransfer transfer(context);
+    context->CopySubresourceRegion(destination, destinationSubresource, left, top, 0,
       source, sourceSubresource, nullptr);
-    ComPtr<ID3D11CommandList> list;
-    hr = commands->FinishCommandList(FALSE, &list);
-    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
-    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
-    if (!list) return E_FAIL;
-    context->ExecuteCommandList(list.Get(), TRUE);
     return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
   }
   D3D11_TEXTURE2D_DESC sourceDesc{};

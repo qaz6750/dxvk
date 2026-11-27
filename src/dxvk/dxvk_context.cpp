@@ -156,6 +156,10 @@ namespace dxvk {
 
     m_device->submitCommandList(this->endRecording(reason), submissionId);
 
+    // Inline submission can lose the device while this chunk is executing.
+    if (m_device->disableExtraThreads() && m_device->getDeviceStatus() != VK_SUCCESS)
+      throw DxvkError("DxvkContext: Inline submission failed");
+
     // If we have a zero buffer, see if we can get rid of it
     freeZeroBuffer();
 

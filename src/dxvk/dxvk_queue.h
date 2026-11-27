@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <list>
 #include <mutex>
 #include <queue>
 
@@ -129,6 +130,8 @@ namespace dxvk {
      */
     void synchronize();
 
+    void pollCompletions();
+
     /**
      * \brief Synchronizes until a given condition becomes true
      *
@@ -137,6 +140,17 @@ namespace dxvk {
      */
     template<typename Pred>
     void synchronizeUntil(const Pred& pred) {
+      if (m_inline) {
+        std::unique_lock lock(m_inlineMutex);
+        while (!pred() && m_lastError.load() == VK_SUCCESS) {
+          if (!finishInline(true)) {
+            m_inlineCond.wait(lock, [&] {
+              return pred() || !m_inlineQueue.empty() || m_lastError.load() != VK_SUCCESS;
+            });
+          }
+        }
+        return;
+      }
       std::unique_lock<dxvk::mutex> lock(m_mutex);
       m_finishCond.wait(lock, pred);
     }
@@ -178,6 +192,11 @@ namespace dxvk {
     DxvkCheckpointBuffer*       m_checkpoints = nullptr;
     DxvkQueueCallback           m_callback;
 
+    const bool                  m_inline;
+    dxvk::recursive_mutex       m_inlineMutex;
+    std::condition_variable_any m_inlineCond;
+    std::list<DxvkSubmitEntry>  m_inlineQueue;
+
     DxvkTimelineSemaphores      m_semaphores;
     DxvkTimelineSemaphoreValues m_timelines;
 
@@ -201,7 +220,17 @@ namespace dxvk {
 
     sync::Fence                 m_submitTimeline;
 
-    uint64_t                    m_submissionTimeout = 5'000'000'000ull;
+    std::atomic<uint64_t>       m_submissionTimeout = { 5'000'000'000ull };
+
+    void stopWorkers();
+
+    void submitInline(DxvkSubmitEntry entry);
+    bool finishInline(bool wait);
+
+    bool executeEntry(DxvkSubmitEntry& entry);
+    bool finishEntry(DxvkSubmitEntry& entry, bool wait);
+    void recycleEntry(const DxvkSubmitEntry& entry);
+    void handleQueueError(VkResult status);
 
     void submitCmdLists();
 

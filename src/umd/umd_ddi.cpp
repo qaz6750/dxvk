@@ -3280,7 +3280,8 @@ HRESULT createDdiDevice(const LUID& luid, D3D10DDIARG_CREATEDEVICE* native, Tabl
   auto dxgiTable = dxgi11 ? nullptr : native->DXGIBaseDDI.pDXGIDDIBaseFunctions;
   auto dxgiTable11 = dxgi11 ? native->DXGIBaseDDI.pDXGIDDIBaseFunctions2 : nullptr;
   const HRESULT hr = device->service->run([&] {
-    return dxvk::umd::createDevice(luid, device->featureLevel,
+    const bool disableExtraThreads = native->Flags & D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION;
+    return dxvk::umd::createDevice(luid, device->featureLevel, disableExtraThreads,
       &device->backend, &device->context);
   });
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;

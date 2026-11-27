@@ -12,7 +12,7 @@ inline bool supportedNativeInterface(UINT interfaceVersion, UINT version, UINT f
   if (isD3D10Interface(interfaceVersion)) {
     const UINT build = interfaceVersion == D3D10_0_DDI_INTERFACE_VERSION
         ? D3D10_0_DDI_BUILD_VERSION : D3D10_0_7_DDI_BUILD_VERSION;
-    return (version >> 16) >= build && flags == 0;
+    return (version >> 16) >= build && !(flags & ~D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION);
   }
   UINT build;
   switch (interfaceVersion) {
@@ -20,7 +20,8 @@ inline bool supportedNativeInterface(UINT interfaceVersion, UINT version, UINT f
     case D3D11_0_7_DDI_INTERFACE_VERSION: build = D3D11_0_7_DDI_BUILD_VERSION; break;
     default: return false;
   }
-  constexpr UINT allowed = D3D11DDI_CREATEDEVICE_FLAG_SINGLETHREADED
+  constexpr UINT allowed = D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION
+    | D3D11DDI_CREATEDEVICE_FLAG_SINGLETHREADED
     | D3D11DDI_CREATEDEVICE_FLAG_3DPIPELINESUPPORT_MASK;
   return (version >> 16) >= build && !(flags & ~allowed)
       && D3D11DDI_EXTRACT_3DPIPELINELEVEL_FROM_FLAGS(flags) == D3D11DDI_3DPIPELINELEVEL_10_0;

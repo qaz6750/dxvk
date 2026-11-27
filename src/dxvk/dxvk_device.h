@@ -90,9 +90,17 @@ namespace dxvk {
       const Rc<vk::DeviceFn>&         vkd,
       const DxvkDeviceCapabilities&   caps,
       const DxvkDeviceQueueSet&       queues,
-      const DxvkQueueCallback&        queueCallback);
+      const DxvkQueueCallback&        queueCallback,
+            bool                          disableExtraThreads = false);
       
     ~DxvkDevice();
+
+    bool disableExtraThreads() const { return m_disableExtraThreads; }
+
+    void pollCompletions() {
+      if (m_disableExtraThreads)
+        m_submissionQueue.pollCompletions();
+    }
     
     /**
      * \brief Vulkan device functions
@@ -746,6 +754,7 @@ namespace dxvk {
   private:
     
     DxvkOptions                 m_options;
+    const bool                  m_disableExtraThreads;
 
     Rc<DxvkInstance>            m_instance;
     Rc<DxvkAdapter>             m_adapter;

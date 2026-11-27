@@ -603,6 +603,10 @@ namespace dxvk {
         ? m_seqOrdered : m_seqHighPrio;
     }
 
+    dxvk::recursive_mutex m_inlineMutex;
+
+    uint64_t executeInline(DxvkCsQueue queue, DxvkCsChunkRef chunk, bool track);
+
     void threadFunc();
     
   };

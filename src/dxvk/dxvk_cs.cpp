@@ -21,17 +21,25 @@ namespace dxvk {
     auto cmd = m_head;
     
     if (m_flags.test(DxvkCsChunkFlag::SingleUse)) {
-      m_commandOffset = 0;
-      
-      while (cmd != nullptr) {
-        auto next = cmd->next();
-        cmd->exec(ctx);
-        cmd->~DxvkCsCmd();
-        cmd = next;
-      }
-
       m_head = nullptr;
       m_next = &m_head;
+
+      try {
+        while (cmd != nullptr) {
+          auto next = cmd->next();
+          cmd->exec(ctx);
+          cmd->~DxvkCsCmd();
+          cmd = next;
+        }
+      } catch (...) {
+        // Earlier commands have already released their captured resources.
+        // Only the throwing command and its unexecuted tail remain live.
+        m_head = cmd;
+        reset();
+        throw;
+      }
+
+      m_commandOffset = 0;
     } else {
       while (cmd != nullptr) {
         cmd->exec(ctx);
@@ -98,9 +106,9 @@ namespace dxvk {
   DxvkCsThread::DxvkCsThread(
     const Rc<DxvkDevice>&   device,
     const Rc<DxvkContext>&  context)
-  : m_device(device), m_context(context),
-    m_thread([this] { threadFunc(); }) {
-    
+  : m_device(device), m_context(context) {
+    if (!device->disableExtraThreads())
+      m_thread = dxvk::thread([this] { threadFunc(); });
   }
   
   
@@ -110,11 +118,15 @@ namespace dxvk {
     }
     
     m_condOnAdd.notify_one();
-    m_thread.join();
+    if (m_thread.joinable())
+      m_thread.join();
   }
   
   
   uint64_t DxvkCsThread::dispatchChunk(DxvkCsChunkRef&& chunk) {
+    if (m_device->disableExtraThreads())
+      return executeInline(DxvkCsQueue::Ordered, std::move(chunk), true);
+
     uint64_t seq;
 
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
@@ -135,6 +147,11 @@ namespace dxvk {
 
 
   void DxvkCsThread::injectChunk(DxvkCsQueue queue, DxvkCsChunkRef&& chunk, bool synchronize) {
+    if (m_device->disableExtraThreads()) {
+      executeInline(queue, std::move(chunk), synchronize);
+      return;
+    }
+
     uint64_t timeline = 0u;
 
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
@@ -166,7 +183,41 @@ namespace dxvk {
   }
 
 
+  uint64_t DxvkCsThread::executeInline(DxvkCsQueue queue, DxvkCsChunkRef chunk, bool track) {
+    std::lock_guard lock(m_inlineMutex);
+    const uint64_t seq = track ? ++getQueue(queue).seqDispatch : 0;
+    // A callback may retire a later sequence before this chunk returns.
+    struct RetireSequence {
+      std::atomic<uint64_t>& completed;
+      uint64_t sequence;
+      ~RetireSequence() {
+        completed.store(std::max(sequence, completed.load()));
+      }
+    } retire { getCounter(queue), seq };
+
+    try {
+      if (m_device->getDeviceStatus() == VK_SUCCESS) {
+        m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+        chunk->executeAll(m_context.ptr());
+      }
+    } catch (const DxvkError& e) {
+      if (m_device->getDeviceStatus() == VK_SUCCESS)
+        throw;
+      Logger::err(e.message());
+    }
+
+    return seq;
+  }
+
+
   void DxvkCsThread::synchronize(uint64_t seq) {
+    if (m_device->disableExtraThreads()) {
+      // Another caller may be executing a chunk, or this caller may have
+      // reentered the frontend while retiring its own submission.
+      std::lock_guard lock(m_inlineMutex);
+      return;
+    }
+
     // Avoid locking if we know the sync is a no-op, may
     // reduce overhead if this is being called frequently
     if (seq > m_seqOrdered.load()) {

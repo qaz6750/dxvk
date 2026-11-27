@@ -371,6 +371,17 @@ namespace dxvk {
         return m_ticketDone + 1u == ticket;
       });
 
+      struct FinishTicket {
+        D3D11Initializer& initializer;
+        std::unique_lock<dxvk::mutex>& lock;
+        ~FinishTicket() {
+          if (!lock.owns_lock())
+            lock.lock();
+          ++initializer.m_ticketDone;
+          initializer.m_ticketCond.notify_all();
+        }
+      } finish { *this, lock };
+
       while (true) {
         // Flush pending commands to guarantee forward progress
         if (m_memoryRecorded - m_memorySignaled + alignedSize > MaxMemoryPerSubmission)
@@ -386,13 +397,15 @@ namespace dxvk {
         // Based on the above, we know that m_memoryRecorded + alignedSize > maxPending.
         uint64_t targetValue = m_memoryRecorded + alignedSize - maxPending;
 
+        // On the calling thread, an injected flush has already processed
+        // its staging signals unless command execution failed.
+        if (m_device->disableExtraThreads() && m_device->getDeviceStatus() != VK_SUCCESS)
+          throw DxvkError("D3D11Initializer: Staging upload failed");
+
         lock.unlock();
         m_memorySignal->wait(targetValue);
         lock.lock();
       }
-
-      m_ticketDone = ticket;
-      m_ticketCond.notify_all();
     }
 
     // Create temporary buffer. We can't really use the "normal" staging
@@ -415,8 +428,8 @@ namespace dxvk {
 
 
   void D3D11Initializer::FlushCsChunkLocked() {
-    m_parent->GetContext()->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(m_csChunk), false);
-    m_csChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+    auto chunk = std::exchange(m_csChunk, m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse));
+    m_parent->GetContext()->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), false);
   }
 
 

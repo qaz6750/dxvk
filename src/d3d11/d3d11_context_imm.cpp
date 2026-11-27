@@ -88,6 +88,8 @@ namespace dxvk {
     // DataSize is 0, but we should ignore that pointer
     pData = DataSize ? pData : nullptr;
 
+    m_device->pollCompletions();
+
     // Get query status directly from the query object
     auto query = static_cast<D3D11Query*>(pAsync);
     HRESULT hr = query->GetData(pData, GetDataFlags);
@@ -290,6 +292,7 @@ namespace dxvk {
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
     D3D10DeviceLock lock = LockContext();
+    m_device->pollCompletions();
 
     if (unlikely(!pResource))
       return E_INVALIDARG;
@@ -330,6 +333,7 @@ namespace dxvk {
           ID3D11Resource*             pResource,
           BOOL*                       pBusy) {
     D3D10DeviceLock lock = LockContext();
+    m_device->pollCompletions();
     if (!pBusy) return E_POINTER;
     *pBusy = TRUE;
     if (!pResource) return E_INVALIDARG;
@@ -999,7 +1003,8 @@ namespace dxvk {
     // can processe them before the first use.
     m_parent->FlushInitCommands();
 
-    m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
+    const auto seq = m_csThread.dispatchChunk(std::move(chunk));
+    m_csSeqNum = std::max(m_csSeqNum, seq);
   }
 
 

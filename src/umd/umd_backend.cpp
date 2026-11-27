@@ -23,7 +23,7 @@ HRESULT isStagingResourceBusy(ID3D11DeviceContext* context, ID3D11Resource* reso
   catch (...) { return DXGI_ERROR_DEVICE_REMOVED; }
 }
 
-HRESULT createDevice(const LUID& luid, D3D_FEATURE_LEVEL level,
+HRESULT createDevice(const LUID& luid, D3D_FEATURE_LEVEL level, bool disableExtraThreads,
                      ID3D11Device** device, ID3D11DeviceContext** context) noexcept {
   if (!device || !context) return E_POINTER;
   *device = nullptr;
@@ -33,7 +33,7 @@ HRESULT createDevice(const LUID& luid, D3D_FEATURE_LEVEL level,
     Rc<DxvkAdapter> adapter;
     HRESULT loaded = openRenderer(luid, 0, instance, adapter);
     if (FAILED(loaded)) return loaded;
-    auto renderer = adapter->createDevice();
+    auto renderer = adapter->createDevice(disableExtraThreads);
     level = implementationFeatureLevel(level);
     if (level > D3D11Device::GetMaxFeatureLevel(*renderer)) return DXGI_ERROR_UNSUPPORTED;
     Com<D3D11DXGIDevice> container = new D3D11DXGIDevice(nullptr, nullptr, nullptr,

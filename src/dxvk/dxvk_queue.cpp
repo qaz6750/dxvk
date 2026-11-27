@@ -7,8 +7,7 @@ namespace dxvk {
   : m_device        (device),
     m_checkpoints   (device->getCheckpointBuffer()),
     m_callback      (callback),
-    m_submitThread  ([this] () { submitCmdLists(); }),
-    m_finishThread  ([this] () { finishCmdLists(); }) {
+    m_inline        (device->disableExtraThreads()) {
     auto vk = m_device->vkd();
 
     VkSemaphoreTypeCreateInfo semaphoreType = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
@@ -16,19 +15,39 @@ namespace dxvk {
 
     VkSemaphoreCreateInfo semaphoreInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &semaphoreType };
 
-    VkResult vrGraphics = vk->vkCreateSemaphore(vk->device(), &semaphoreInfo, nullptr, &m_semaphores.graphics);
-    VkResult vrTransfer = vk->vkCreateSemaphore(vk->device(), &semaphoreInfo, nullptr, &m_semaphores.transfer);
+    VkResult vr = vk->vkCreateSemaphore(vk->device(), &semaphoreInfo, nullptr, &m_semaphores.graphics);
+    if (vr != VK_SUCCESS)
+      throw DxvkError(str::format("Failed to create graphics timeline semaphore: ", vr));
 
-    if (vrGraphics || vrTransfer) {
-      throw DxvkError(str::format("Failed to create timeline semaphores: ",
-        vrGraphics > vrTransfer ? vrGraphics : vrTransfer));
+    vr = vk->vkCreateSemaphore(vk->device(), &semaphoreInfo, nullptr, &m_semaphores.transfer);
+    if (vr != VK_SUCCESS) {
+      vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
+      throw DxvkError(str::format("Failed to create transfer timeline semaphore: ", vr));
+    }
+
+    if (!m_inline) {
+      try {
+        m_submitThread = dxvk::thread([this] { submitCmdLists(); });
+        m_finishThread = dxvk::thread([this] { finishCmdLists(); });
+      } catch (...) {
+        stopWorkers();
+        vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
+        vk->vkDestroySemaphore(vk->device(), m_semaphores.transfer, nullptr);
+        throw;
+      }
     }
   }
-  
-  
-  DxvkSubmissionQueue::~DxvkSubmissionQueue() {
-    auto vk = m_device->vkd();
 
+
+  DxvkSubmissionQueue::~DxvkSubmissionQueue() {
+    stopWorkers();
+    auto vk = m_device->vkd();
+    vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
+    vk->vkDestroySemaphore(vk->device(), m_semaphores.transfer, nullptr);
+  }
+
+
+  void DxvkSubmissionQueue::stopWorkers() {
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
       m_stopped.store(true);
     }
@@ -36,26 +55,28 @@ namespace dxvk {
     m_appendCond.notify_all();
     m_submitCond.notify_all();
 
-    m_submitThread.join();
-    m_finishThread.join();
-
-    vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
-    vk->vkDestroySemaphore(vk->device(), m_semaphores.transfer, nullptr);
+    if (m_submitThread.joinable())
+      m_submitThread.join();
+    if (m_finishThread.joinable())
+      m_finishThread.join();
   }
   
   
   void DxvkSubmissionQueue::submit(
           DxvkSubmitInfo            submitInfo,
           uint64_t                  submissionId) {
+    DxvkSubmitEntry entry = { };
+    entry.timeline = submissionId;
+    entry.submit = std::move(submitInfo);
+
+    if (m_inline)
+      return submitInline(std::move(entry));
+
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
     m_finishCond.wait(lock, [this] {
       return m_submitQueue.size() + m_finishQueue.size() <= MaxNumQueuedCommandBuffers;
     });
-
-    DxvkSubmitEntry entry = { };
-    entry.timeline = submissionId;
-    entry.submit = std::move(submitInfo);
 
     m_submitQueue.push(std::move(entry));
     m_appendCond.notify_all();
@@ -64,10 +85,13 @@ namespace dxvk {
 
   void DxvkSubmissionQueue::present(
           DxvkPresentInfo           presentInfo) {
-    std::unique_lock<dxvk::mutex> lock(m_mutex);
-
     DxvkSubmitEntry entry = { };
     entry.present = std::move(presentInfo);
+
+    if (m_inline)
+      return submitInline(std::move(entry));
+
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
 
     m_submitQueue.push(std::move(entry));
     m_appendCond.notify_all();
@@ -75,11 +99,20 @@ namespace dxvk {
 
 
   void DxvkSubmissionQueue::synchronizeSubmission(uint64_t submissionId) {
-    m_submitTimeline.wait(submissionId);
+    if (m_inline) {
+      std::unique_lock lock(m_inlineMutex);
+      m_inlineCond.wait(lock, [&] {
+        return m_submitTimeline.value() >= submissionId || m_lastError.load() != VK_SUCCESS;
+      });
+    } else {
+      m_submitTimeline.wait(submissionId);
+    }
   }
 
 
   void DxvkSubmissionQueue::synchronize() {
+    if (m_inline)
+      return pollCompletions();
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
     m_submitCond.wait(lock, [this] {
@@ -89,6 +122,12 @@ namespace dxvk {
 
 
   void DxvkSubmissionQueue::waitForIdle() {
+    if (m_inline) {
+      std::lock_guard lock(m_inlineMutex);
+      while (finishInline(true)) { }
+      return;
+    }
+
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
     m_submitCond.wait(lock, [this] {
@@ -118,8 +157,158 @@ namespace dxvk {
 
 
   void DxvkSubmissionQueue::setSubmissionTimeout(uint64_t timeout) {
-    std::unique_lock<dxvk::mutex> lock(m_mutex);
-    m_submissionTimeout = timeout;
+    m_submissionTimeout.store(timeout);
+  }
+
+
+  void DxvkSubmissionQueue::pollCompletions() {
+    std::lock_guard lock(m_inlineMutex);
+    while (finishInline(false)) { }
+  }
+
+
+  void DxvkSubmissionQueue::submitInline(DxvkSubmitEntry entry) {
+    std::lock_guard lock(m_inlineMutex);
+    while (m_inlineQueue.size() >= MaxNumQueuedCommandBuffers)
+      finishInline(true);
+
+    // Allocate the retirement node before the GPU can reference the list.
+    std::list<DxvkSubmitEntry> pending;
+    pending.push_back(std::move(entry));
+    if (executeEntry(pending.front()))
+      m_inlineQueue.splice(m_inlineQueue.end(), pending);
+    m_inlineCond.notify_all();
+    while (finishInline(false)) { }
+    m_device->m_objects.memoryManager().performTimedTasks();
+  }
+
+
+  bool DxvkSubmissionQueue::finishInline(bool wait) {
+    if (m_inlineQueue.empty())
+      return false;
+
+    // Completion callbacks may reenter and drain the remaining queue.
+    std::list<DxvkSubmitEntry> retiring;
+    retiring.splice(retiring.end(), m_inlineQueue, m_inlineQueue.begin());
+    if (!finishEntry(retiring.front(), wait)) {
+      m_inlineQueue.splice(m_inlineQueue.begin(), retiring);
+      return false;
+    }
+
+    recycleEntry(retiring.front());
+    m_inlineCond.notify_all();
+    return true;
+  }
+
+
+  bool DxvkSubmissionQueue::executeEntry(DxvkSubmitEntry& entry) {
+    // Submit command buffer to device. Don't submit anything after
+    // device loss so that drivers get a chance to recover
+    VkResult status = m_lastError;
+
+    if (status != VK_ERROR_DEVICE_LOST) {
+      std::lock_guard<dxvk::mutex> lock(m_mutexQueue);
+
+      if (m_callback)
+        m_callback(true);
+
+      if (entry.submit.cmdList != nullptr) {
+        status = entry.submit.cmdList->submit(
+          m_semaphores, m_timelines);
+        entry.timelines = m_timelines;
+      } else if (entry.present.presenter != nullptr) {
+        status = entry.present.presenter->presentImage(entry.present.frameId,
+          entry.present.latencyFrameId, entry.present.rects.size(),
+          entry.present.rects.data());
+      }
+
+      if (m_callback)
+        m_callback(false);
+    }
+
+    if (entry.timeline > m_submitTimeline.value())
+      m_submitTimeline.signal(entry.timeline);
+
+    if (status == VK_ERROR_DEVICE_LOST && m_checkpoints)
+      m_checkpoints->printHangInfo();
+
+    if (status == VK_SUCCESS || (entry.present.presenter && status != VK_ERROR_DEVICE_LOST))
+      return true;
+
+    Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
+    handleQueueError(status);
+    return false;
+  }
+
+
+  void DxvkSubmissionQueue::handleQueueError(VkResult status) {
+    m_lastError.store(status);
+    if (status != VK_ERROR_DEVICE_LOST) {
+      // The current entry still belongs to us. Synchronize Vulkan directly
+      // without waiting for the submission or completion worker itself.
+      lockDeviceQueue();
+      auto vk = m_device->vkd();
+      if (vk->vkDeviceWaitIdle(vk->device()) == VK_ERROR_DEVICE_LOST)
+        m_lastError.store(VK_ERROR_DEVICE_LOST);
+      unlockDeviceQueue();
+    }
+  }
+
+
+  bool DxvkSubmissionQueue::finishEntry(DxvkSubmitEntry& entry, bool wait) {
+    auto vk = m_device->vkd();
+    if (entry.submit.cmdList != nullptr) {
+      VkResult status = m_lastError.load();
+
+      if (status != VK_ERROR_DEVICE_LOST) {
+        std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
+        std::array<uint64_t, 2> timelines = { entry.timelines.graphics, entry.timelines.transfer };
+
+        VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        waitInfo.semaphoreCount = semaphores.size();
+        waitInfo.pSemaphores = semaphores.data();
+        waitInfo.pValues = timelines.data();
+
+        // Treat a timeout here as DEVICE_LOST. Sometimes we just don't get
+        // DEVICE_LOST from the driver for some reason.
+        status = vk->vkWaitSemaphores(vk->device(), &waitInfo, wait ? m_submissionTimeout.load() : 0);
+        if (status == VK_TIMEOUT && !wait)
+          return false;
+
+        if (status == VK_TIMEOUT) {
+          Logger::err("DxvkSubmissionQueue: Timeout occured, GPU likely hung.");
+          status = VK_ERROR_DEVICE_LOST;
+        }
+      }
+
+      if (status == VK_ERROR_DEVICE_LOST && m_checkpoints)
+        m_checkpoints->printHangInfo();
+
+      if (status != VK_SUCCESS)
+        handleQueueError(status);
+    } else if (entry.present.presenter != nullptr) {
+      // Signal the frame and then immediately destroy the reference.
+      // This is necessary since the front-end may want to explicitly
+      // destroy the presenter object.
+      entry.present.presenter->signalFrame(entry.present.frameId);
+      entry.present.presenter = nullptr;
+    }
+
+    // Release resources and signal events, then immediately wake
+    // up any thread that's currently waiting on a resource in
+    // order to reduce delays as much as possible.
+    if (entry.submit.cmdList != nullptr)
+      entry.submit.cmdList->notifyObjects();
+    return true;
+  }
+
+
+  void DxvkSubmissionQueue::recycleEntry(const DxvkSubmitEntry& entry) {
+    // Free the command list and associated objects now
+    if (entry.submit.cmdList != nullptr) {
+      entry.submit.cmdList->reset();
+      m_device->recycleCommandList(entry.submit.cmdList);
+    }
   }
 
 
@@ -141,53 +330,17 @@ namespace dxvk {
         entry = std::move(m_submitQueue.front());
       }
 
-      // Submit command buffer to device. Don't submit anything after
-      // device loss so that drivers get a chance to recover
-      VkResult status = m_lastError;
-
-      if (status != VK_ERROR_DEVICE_LOST) {
-        std::lock_guard<dxvk::mutex> lock(m_mutexQueue);
-
-        if (m_callback)
-          m_callback(true);
-
-        if (entry.submit.cmdList != nullptr) {
-          status = entry.submit.cmdList->submit(
-            m_semaphores, m_timelines);
-          entry.timelines = m_timelines;
-        } else if (entry.present.presenter != nullptr) {
-          status = entry.present.presenter->presentImage(entry.present.frameId,
-            entry.present.latencyFrameId, entry.present.rects.size(),
-            entry.present.rects.data());
-        }
-
-        if (m_callback)
-          m_callback(false);
-      }
-
-      if (entry.timeline)
-        m_submitTimeline.signal(entry.timeline);
-
-      if (status == VK_ERROR_DEVICE_LOST && m_checkpoints)
-        m_checkpoints->printHangInfo();
+      const bool forward = executeEntry(entry);
 
       // On success, pass it on to the queue thread
       { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
-        bool doForward = (status == VK_SUCCESS) ||
-          (entry.present.presenter && status != VK_ERROR_DEVICE_LOST);
-
-        if (doForward) {
+        if (forward)
           m_finishQueue.push(std::move(entry));
-        } else {
-          Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
-          m_lastError = status;
-
-          if (status != VK_ERROR_DEVICE_LOST)
-            m_device->waitForIdle();
-        }
 
         m_submitQueue.pop();
+        if (!forward)
+          m_finishCond.notify_all();
         m_submitCond.notify_all();
       }
 
@@ -201,11 +354,8 @@ namespace dxvk {
   void DxvkSubmissionQueue::finishCmdLists() {
     env::setThreadName("dxvk-queue");
 
-    auto vk = m_device->vkd();
-
     while (!m_stopped.load()) {
       std::unique_lock<dxvk::mutex> lock(m_mutex);
-      uint64_t submissionTimeout = m_submissionTimeout;
 
       if (m_finishQueue.empty()) {
         auto t0 = dxvk::high_resolution_clock::now();
@@ -224,61 +374,14 @@ namespace dxvk {
       DxvkSubmitEntry entry = std::move(m_finishQueue.front());
       lock.unlock();
       
-      if (entry.submit.cmdList != nullptr) {
-        VkResult status = m_lastError.load();
-
-        if (status != VK_ERROR_DEVICE_LOST) {
-          std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
-          std::array<uint64_t, 2> timelines = { entry.timelines.graphics, entry.timelines.transfer };
-
-          VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-          waitInfo.semaphoreCount = semaphores.size();
-          waitInfo.pSemaphores = semaphores.data();
-          waitInfo.pValues = timelines.data();
-
-          // Treat a timeout here as DEVICE_LOST. Sometimes we just don't get
-          // DEVICE_LOST from the driver for some reason.
-          status = vk->vkWaitSemaphores(vk->device(), &waitInfo, submissionTimeout);
-
-          if (status == VK_TIMEOUT) {
-            Logger::err("DxvkSubmissionQueue: Timeout occured, GPU likely hung.");
-            status = VK_ERROR_DEVICE_LOST;
-          }
-        }
-
-        if (status == VK_ERROR_DEVICE_LOST && m_checkpoints)
-          m_checkpoints->printHangInfo();
-
-        if (status != VK_SUCCESS) {
-          m_lastError = status;
-
-          if (status != VK_ERROR_DEVICE_LOST)
-            m_device->waitForIdle();
-        }
-      } else if (entry.present.presenter != nullptr) {
-        // Signal the frame and then immediately destroy the reference.
-        // This is necessary since the front-end may want to explicitly
-        // destroy the presenter object. 
-        entry.present.presenter->signalFrame(entry.present.frameId);
-        entry.present.presenter = nullptr;
-      }
-
-      // Release resources and signal events, then immediately wake
-      // up any thread that's currently waiting on a resource in
-      // order to reduce delays as much as possible.
-      if (entry.submit.cmdList != nullptr)
-        entry.submit.cmdList->notifyObjects();
+      finishEntry(entry, true);
 
       lock.lock();
       m_finishQueue.pop();
       m_finishCond.notify_all();
       lock.unlock();
 
-      // Free the command list and associated objects now
-      if (entry.submit.cmdList != nullptr) {
-        entry.submit.cmdList->reset();
-        m_device->recycleCommandList(entry.submit.cmdList);
-      }
+      recycleEntry(entry);
     }
   }
   

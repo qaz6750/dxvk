@@ -196,11 +196,11 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkDevice> DxvkAdapter::createDevice() {
-    Rc<DxvkDevice> device = createDevice(false);
+  Rc<DxvkDevice> DxvkAdapter::createDevice(bool disableExtraThreads) {
+    Rc<DxvkDevice> device = createDevice(false, disableExtraThreads);
 
     if (!device)
-      device = createDevice(true);
+      device = createDevice(true, disableExtraThreads);
 
     if (!device)
       throw DxvkError("Failed to initialize DXVK device.");
@@ -209,7 +209,7 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkDevice> DxvkAdapter::createDevice(bool safeMode) {
+  Rc<DxvkDevice> DxvkAdapter::createDevice(bool safeMode, bool disableExtraThreads) {
     auto vk = m_instance->vki();
 
     DxvkDeviceCapabilities caps(*m_instance, m_handle, nullptr, safeMode);
@@ -302,7 +302,7 @@ namespace dxvk {
     deviceQueues.transfer = getDeviceQueue(vkd, caps, queueMapping.transfer);
     deviceQueues.sparse   = getDeviceQueue(vkd, caps, queueMapping.sparse);
 
-    return new DxvkDevice(m_instance, this, vkd, caps, deviceQueues, DxvkQueueCallback());
+    return new DxvkDevice(m_instance, this, vkd, caps, deviceQueues, DxvkQueueCallback(), disableExtraThreads);
   }
 
 

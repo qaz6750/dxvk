@@ -1207,8 +1207,7 @@ namespace dxvk {
       }
 
       if (unlikely(!m_csChunk->push(command))) {
-        GetTypedContext()->EmitCsChunk(std::move(m_csChunk));
-        m_csChunk = AllocCsChunk();
+        GetTypedContext()->EmitCsChunk(std::exchange(m_csChunk, AllocCsChunk()));
 
         if constexpr (!IsDeferred && AllowFlush)
           GetTypedContext()->ConsiderFlush(GpuFlushType::ImplicitWeakHint);
@@ -1223,8 +1222,7 @@ namespace dxvk {
       m_csData = m_csChunk->pushCmd<M, Cmd>(command, count);
 
       if (unlikely(!m_csData)) {
-        GetTypedContext()->EmitCsChunk(std::move(m_csChunk));
-        m_csChunk = AllocCsChunk();
+        GetTypedContext()->EmitCsChunk(std::exchange(m_csChunk, AllocCsChunk()));
 
         if constexpr (!IsDeferred && AllowFlush)
           GetTypedContext()->ConsiderFlush(GpuFlushType::ImplicitWeakHint);
@@ -1240,8 +1238,7 @@ namespace dxvk {
         m_csData = nullptr;
         m_csDataType = D3D11CmdType::None;
 
-        GetTypedContext()->EmitCsChunk(std::move(m_csChunk));
-        m_csChunk = AllocCsChunk();
+        GetTypedContext()->EmitCsChunk(std::exchange(m_csChunk, AllocCsChunk()));
       }
     }
 

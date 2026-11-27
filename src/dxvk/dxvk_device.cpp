@@ -11,8 +11,10 @@ namespace dxvk {
     const Rc<vk::DeviceFn>&         vkd,
     const DxvkDeviceCapabilities&   caps,
     const DxvkDeviceQueueSet&       queues,
-    const DxvkQueueCallback&        queueCallback)
+    const DxvkQueueCallback&        queueCallback,
+            bool                          disableExtraThreads)
   : m_options           (instance->options()),
+    m_disableExtraThreads(disableExtraThreads),
     m_instance          (instance),
     m_adapter           (adapter),
     m_vkd               (vkd),
@@ -36,7 +38,7 @@ namespace dxvk {
 
     determineShaderOptions();
 
-    if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty())
+    if (!m_disableExtraThreads && env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty())
       m_shaderCache = DxvkShaderCache::getInstance();
 
     logBindingModel();
@@ -613,10 +615,12 @@ namespace dxvk {
     DxvkSubmitInfo submitInfo = { };
     submitInfo.cmdList = commandList;
 
+    // Retirement can recycle and reset the list before submit returns.
+    auto counters = commandList->statCounters();
     m_submissionQueue.submit(submitInfo, submissionId);
 
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
-    m_statCounters.merge(commandList->statCounters());
+    m_statCounters.merge(counters);
   }
 
 
@@ -636,7 +640,10 @@ namespace dxvk {
 
     auto t0 = dxvk::high_resolution_clock::now();
 
-    fence.wait(value);
+    if (m_disableExtraThreads)
+      m_submissionQueue.synchronizeUntil([&] { return fence.value() >= value; });
+    else
+      fence.wait(value);
 
     auto t1 = dxvk::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);

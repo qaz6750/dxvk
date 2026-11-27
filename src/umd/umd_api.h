@@ -11,7 +11,7 @@ namespace dxvk::umd {
 inline constexpr D3D_FEATURE_LEVEL implementationFeatureLevel(D3D_FEATURE_LEVEL requested) {
   return requested < D3D_FEATURE_LEVEL_11_0 ? D3D_FEATURE_LEVEL_11_0 : requested;
 }
-HRESULT createDevice(const LUID& luid, D3D_FEATURE_LEVEL level,
+HRESULT createDevice(const LUID& luid, D3D_FEATURE_LEVEL level, bool disableExtraThreads,
                      ID3D11Device** device, ID3D11DeviceContext** context) noexcept;
 // Query the same Vulkan attachment limits used to build the format support flags.
 HRESULT getAttachmentFormatSupport(ID3D11Device* device, DXGI_FORMAT format,

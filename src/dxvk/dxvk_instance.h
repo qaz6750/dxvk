@@ -198,7 +198,12 @@ namespace dxvk {
     Config                    m_config;
     DxvkOptions               m_options;
 
-    bool                      m_nativeDriver = false;
+    struct WsiSession {
+      explicit WsiSession(bool enabled);
+      ~WsiSession();
+      const bool enabled;
+    } m_wsi;
+
     Rc<vk::LibraryFn>         m_vkl = nullptr;
     Rc<vk::InstanceFn>        m_vki = nullptr;
 

@@ -10,33 +10,10 @@ using PSGPERRORID = UINT;
 
 namespace dxvk {
   Logger Logger::s_instance("d3d9.log");
-
-  HRESULT CreateD3D9(
-          bool           Extended,
-          IDirect3D9Ex** ppDirect3D9Ex,
-    const D3D9ON12_ARGS* pOverrideList,
-          uint32_t       OverrideCount) {
-    if (!ppDirect3D9Ex)
-      return D3DERR_INVALIDCALL;
-
-    *ppDirect3D9Ex = ref(new D3D9InterfaceEx(Extended, pOverrideList, OverrideCount));
-    return D3D_OK;
-  }
 }
 
 
 extern "C" {
-
-  DLLEXPORT IDirect3D9* __stdcall Direct3DCreate9(UINT nSDKVersion) {
-    IDirect3D9Ex* pDirect3D = nullptr;
-    dxvk::CreateD3D9(false, &pDirect3D, nullptr, 0);
-
-    return pDirect3D;
-  }
-
-  DLLEXPORT HRESULT __stdcall Direct3DCreate9Ex(UINT nSDKVersion, IDirect3D9Ex** ppDirect3D9Ex) {
-    return dxvk::CreateD3D9(true, ppDirect3D9Ex, nullptr, 0);
-  }
 
   DLLEXPORT int __stdcall D3DPERF_BeginEvent(D3DCOLOR col, LPCWSTR wszName) {
     return dxvk::D3D9GlobalAnnotationList::Instance().BeginEvent(col, wszName);

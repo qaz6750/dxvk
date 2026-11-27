@@ -14,8 +14,18 @@ namespace dxvk {
 
   Singleton<DxvkInstance> g_dxvkInstance;
 
+  Rc<DxvkInstance> D3D9InterfaceEx::SharedInstance::acquire() {
+    auto instance = g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9);
+    acquired = true;
+    return instance;
+  }
+
+  D3D9InterfaceEx::SharedInstance::~SharedInstance() {
+    if (acquired) g_dxvkInstance.release();
+  }
+
   D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended, const D3D9ON12_ARGS* pOverrideList, uint32_t OverrideCount)
-    : m_instance           ( g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9) )
+    : m_instance           ( m_sharedInstance.acquire() )
     , m_legacyD3DBridge    ( this )
     , m_d3d9Options        ( nullptr, m_instance->config() )
     , m_d3d9Interop        ( this )
@@ -116,7 +126,6 @@ namespace dxvk {
   D3D9InterfaceEx::D3D9InterfaceEx(Rc<DxvkInstance> instance, Rc<DxvkAdapter> adapter,
                                  bool extended)
     : m_instance           ( std::move(instance) )
-    , m_nativeRenderer     ( true )
     , m_legacyD3DBridge    ( this )
     , m_d3d9Options        ( nullptr, m_instance->config() )
     , m_d3d9Interop        ( this )
@@ -124,12 +133,6 @@ namespace dxvk {
     if (extended)
       m_d3dCompatibility.set(D3DCompatibility::D3D9Ex);
     m_adapters.emplace_back(new D3D9Adapter(this, nullptr, m_instance, adapter, 0, 0, nullptr));
-  }
-
-
-  D3D9InterfaceEx::~D3D9InterfaceEx() {
-    if (!m_nativeRenderer)
-      g_dxvkInstance.release();
   }
 
 
@@ -415,7 +418,7 @@ namespace dxvk {
           IDirect3DDevice9Ex**   ppReturnedDeviceInterface) {
     InitReturnPtr(ppReturnedDeviceInterface);
 
-    if (m_nativeRenderer)
+    if (IsNativeRenderer())
       return D3DERR_NOTAVAILABLE;
 
     if (unlikely(ppReturnedDeviceInterface  == nullptr

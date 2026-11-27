@@ -16,20 +16,27 @@
 
 namespace dxvk {
 
+  DxvkInstance::WsiSession::WsiSession(bool enable) : enabled(enable) {
+    if (enabled) wsi::init();
+  }
+
+  DxvkInstance::WsiSession::~WsiSession() {
+    if (enabled) wsi::quit();
+  }
+
   DxvkInstance::DxvkInstance(DxvkInstanceFlags flags)
   : DxvkInstance(DxvkInstanceImportInfo(), flags) {
 
   }
 
 
-  DxvkInstance::DxvkInstance(const DxvkInstanceImportInfo& args, DxvkInstanceFlags flags) {
+  DxvkInstance::DxvkInstance(const DxvkInstanceImportInfo& args, DxvkInstanceFlags flags)
+  : m_wsi(args.nativeDriverLibrary == nullptr) {
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK: ", DXVK_VERSION));
     Logger::info(str::format("Build: ", DXVK_TARGET, " ", DXVK_COMPILER, " ", DXVK_COMPILER_VERSION));
 
-    m_nativeDriver = args.nativeDriverLibrary != nullptr;
-    if (!m_nativeDriver) {
-      wsi::init();
+    if (m_wsi.enabled) {
       m_config = Config::getUserConfig();
       m_config.merge(Config::getAppConfig(env::getExePath()));
       m_config.logOptions();
@@ -42,7 +49,7 @@ namespace dxvk {
       throw DxvkError("Failed to load vulkan-1 library.");
 
     // Initialize extension providers
-    if (!m_nativeDriver) {
+    if (m_wsi.enabled) {
       m_extProviders.push_back(&DxvkPlatformExts::s_instance);
 #ifdef _WIN32
       m_extProviders.push_back(&VrInstance::s_instance);
@@ -68,9 +75,6 @@ namespace dxvk {
   DxvkInstance::~DxvkInstance() {
     if (m_messenger)
       m_vki->vkDestroyDebugUtilsMessengerEXT(m_vki->instance(), m_messenger, nullptr);
-
-    if (!m_nativeDriver)
-      wsi::quit();
   }
   
   
@@ -355,7 +359,7 @@ namespace dxvk {
     }
 
     if (m_adapters.empty()) {
-      if (m_nativeDriver)
+      if (!m_wsi.enabled)
         return true; // The native DDI reports the missing adapter by LUID.
 
       Logger::warn(str::format(

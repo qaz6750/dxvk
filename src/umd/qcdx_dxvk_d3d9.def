@@ -1,0 +1,7 @@
+LIBRARY qcdx_dxvk
+EXPORTS
+    OpenAdapter @1
+    OpenAdapter10 @2
+    OpenAdapter10_2 @3
+    Direct3DCreate9 @4
+    Direct3DCreate9Ex @5

@@ -8,6 +8,9 @@
 
 namespace dxvk {
 
+  HRESULT CreateD3D9(bool extended, IDirect3D9Ex** output,
+                     const D3D9ON12_ARGS* overrides, uint32_t overrideCount);
+
   /**
   * \brief D3D9 interface implementation
   *
@@ -29,7 +32,7 @@ namespace dxvk {
     D3D9InterfaceEx(Rc<DxvkInstance> instance, Rc<DxvkAdapter> adapter,
                    bool extended = true);
 
-    ~D3D9InterfaceEx();
+    ~D3D9InterfaceEx() = default;
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject);
 
@@ -173,7 +176,7 @@ namespace dxvk {
 
     Rc<DxvkInstance> GetInstance() { return m_instance; }
 
-    bool IsNativeRenderer() const { return m_nativeRenderer; }
+    bool IsNativeRenderer() const { return !m_sharedInstance.acquired; }
 
     bool HasFormatsUnlocked() const { return m_unlockAdditionalFormats; }
 
@@ -188,8 +191,12 @@ namespace dxvk {
         adapter->RefreshFormatsTable();
     }
 
+    struct SharedInstance {
+      Rc<DxvkInstance> acquire();
+      ~SharedInstance();
+      bool acquired = false;
+    } m_sharedInstance;
     Rc<DxvkInstance>              m_instance;
-    bool                         m_nativeRenderer = false;
 
     DxvkLegacyD3DInterfaceBridge  m_legacyD3DBridge;
     D3DCompatibilityFlags         m_d3dCompatibility;

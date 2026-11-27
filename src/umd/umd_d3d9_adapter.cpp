@@ -171,7 +171,7 @@ HRESULT APIENTRY closeAdapter(HANDLE handle) {
 }
 }
 
-extern "C" __declspec(dllexport) HRESULT APIENTRY OpenAdapter(D3DDDIARG_OPENADAPTER* args) {
+extern "C" HRESULT APIENTRY OpenAdapter(D3DDDIARG_OPENADAPTER* args) {
   if (!args || !args->hAdapter || !args->pAdapterFuncs || !args->pAdapterCallbacks ||
       !args->pAdapterCallbacks->pfnQueryAdapterInfoCb) return E_INVALIDARG;
   if (args->Interface != 9) return D3DERR_NOTAVAILABLE;

@@ -30,8 +30,10 @@ namespace dxvk::wsi {
   };
 
   void init() {
-    if (s_refcount++ > 0)
+    if (s_refcount > 0) {
+      ++s_refcount;
       return;
+    }
 
     std::string hint = dxvk::env::getEnvVar("DXVK_WSI_DRIVER");
     if (hint == "") {
@@ -54,6 +56,8 @@ namespace dxvk::wsi {
 
     if (!success)
       throw DxvkError("Failed to initialize WSI.");
+
+    ++s_refcount;
   }
 
   void quit() {

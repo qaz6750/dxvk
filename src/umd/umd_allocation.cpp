@@ -147,7 +147,9 @@ HRESULT RuntimeMemory::release(const std::shared_ptr<VidmmSurface>& binding) {
   if (resource && device) {
     D3DDDICB_DEALLOCATE2 destroy = {};
     destroy.hResource = resource;
-    destroy.Flags.SynchronousDestroy = 1;
+    // VidMM owns the backing pages and tracks outstanding presents. Ordinary
+    // surface release can return while VidMM retires its last reference.
+    destroy.Flags.SynchronousDestroy = closing || FAILED(hr);
     HRESULT result = callbacks.pfnDeallocate2Cb(device, &destroy);
     if (FAILED(result)) return result;
   }

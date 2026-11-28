@@ -61,13 +61,17 @@ DXGI_FORMAT allocationFormat(const qcdx_alloc& a) {
   switch (a.format) {
     case 21: return srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
     case 22: return srgb ? DXGI_FORMAT_B8G8R8X8_UNORM_SRGB : DXGI_FORMAT_B8G8R8X8_UNORM;
+    case 28: return srgb ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_A8_UNORM;
     case 31: return srgb ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R10G10B10A2_UNORM;
     case 113: return srgb ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R16G16B16A16_FLOAT;
     case 32: return srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     default: return DXGI_FORMAT_UNKNOWN;
   }
 }
-static UINT pixelBytes(const qcdx_alloc& a) { return a.format == 113 ? 8u : 4u; }
+static UINT pixelBytes(const qcdx_alloc& a) {
+  if (a.format == 28) return 1;
+  return a.format == 113 ? 8u : 4u;
+}
 static UINT rowBytes(const qcdx_alloc& a) { return a.width * pixelBytes(a); }
 static bool unsupportedCopy(HRESULT hr) {
   return hr == E_NOTIMPL || hr == E_INVALIDARG || hr == DXGI_ERROR_UNSUPPORTED;
@@ -77,6 +81,7 @@ static bool validSurface(const qcdx_alloc& a) {
   return a.magic == QCDX_ALLOC_MAGIC && !a.bo && !a.bo_offset && !(a.flags & ~knownFlags)
       && a.kind <= QCDX_ALLOC_GDI && a.width && a.height && a.width <= 16384 && a.height <= 16384
       && (!primaryAllocation(a) || !a.vidpn) && allocationFormat(a) != DXGI_FORMAT_UNKNOWN
+      && (!primaryAllocation(a) || a.format != 28)
       && a.pitch >= rowBytes(a) && !(a.pitch % 4) && uint64_t(a.pitch) * a.height <= a.size
       && a.size <= maxSurfaceSize;
 }
@@ -144,6 +149,10 @@ HRESULT RuntimeMemory::allocate(RuntimeAllocation& out, HANDLE resource, UINT wi
   layout.height = height;
   layout.flags = primary ? QCDX_ALLOC_F_PRIMARY : 0;
   switch (format) {
+    case DXGI_FORMAT_A8_UNORM:
+      if (primary) return DXGI_ERROR_UNSUPPORTED;
+      layout.format = 28;
+      break;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: layout.format = 113; break;
     case DXGI_FORMAT_R10G10B10A2_UNORM: layout.format = 31; break;
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: layout.flags |= QCDX_ALLOC_F_SRGB; [[fallthrough]];
@@ -154,7 +163,7 @@ HRESULT RuntimeMemory::allocate(RuntimeAllocation& out, HANDLE resource, UINT wi
     case DXGI_FORMAT_R8G8B8A8_UNORM: layout.format = 32; break;
     default: return DXGI_ERROR_UNSUPPORTED;
   }
-  layout.pitch = rowBytes(layout);
+  layout.pitch = (rowBytes(layout) + 3u) & ~3u;
   if (uint64_t(layout.pitch) * height > maxSurfaceSize) return E_OUTOFMEMORY;
   layout.size = layout.pitch * height;
   auto binding = std::make_shared<VidmmSurface>();

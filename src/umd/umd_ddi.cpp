@@ -768,7 +768,8 @@ bool sharedSurfaceShape(const D3D10DDIARG_CREATERESOURCE& args) {
       && args.MipLevels == 1 && args.ArraySize == 1
       && args.SampleDesc.Count == 1 && !args.SampleDesc.Quality
       && args.Usage == D3D10_DDI_USAGE_DEFAULT && !args.MapFlags
-      && dxvk::umd::presentStorageFormat(args.Format) != DXGI_FORMAT_UNKNOWN;
+      && (args.Format == DXGI_FORMAT_A8_UNORM
+        || dxvk::umd::presentStorageFormat(args.Format) != DXGI_FORMAT_UNKNOWN);
 }
 
 // Give a freshly created resource its kernel allocation and shared surface.

@@ -690,16 +690,24 @@ void trackSharedSurface(Device* device,
 // more corruption than the one that already went wrong.
 HRESULT publishSharedSurfaces(Device* device, const dxvk::umd::SharedSurface* excluded = nullptr) {
   if (!device->anySharedSurface) return S_OK;
-  // A callback may append to the weak registry or retire a resource while a
-  // transfer is suspended. Pin the sweep and backend references beforehand.
+  // Clean flip buffers need no handoff. Once a dirty surface is found,
+  // pin all remaining entries: a runtime callback can dirty a later entry
+  // or retire its resource while the first transfer is suspended.
+  std::vector<std::shared_ptr<dxvk::umd::SharedSurface>> surfaces;
+  const auto& entries = device->sharedSurfaces;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    auto surface = entries[i].lock();
+    if (!surface || surface.get() == excluded) continue;
+    if (surfaces.empty()) {
+      if (surface->state.damage.empty()) continue;
+      surfaces.reserve(entries.size() - i);
+    }
+    surfaces.push_back(std::move(surface));
+  }
+  if (surfaces.empty()) return S_OK;
   auto backend = device->backend;
   auto context = device->context;
   const auto epoch = device->sharedEpoch;
-  std::vector<std::shared_ptr<dxvk::umd::SharedSurface>> surfaces;
-  surfaces.reserve(device->sharedSurfaces.size());
-  for (auto& entry : device->sharedSurfaces)
-    if (auto surface = entry.lock(); surface && surface.get() != excluded)
-      surfaces.push_back(std::move(surface));
   HRESULT result = S_OK;
   for (auto& surface : surfaces) {
     const HRESULT hr = dxvk::umd::publishSharedSurface(backend.Get(),

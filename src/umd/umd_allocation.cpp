@@ -1,10 +1,58 @@
 #include "umd_allocation.h"
 #include "umd_api.h"
 #include "umd_residency_transaction.h"
+#include "umd_process_storage.h"
+#include <evntrace.h>
+#include <TraceLoggingProvider.h>
 #include <cstring>
 #include <utility>
 
 namespace dxvk::umd {
+namespace {
+TRACELOGGING_DEFINE_PROVIDER(presentProvider, "Qcdx-Dxvk-Present",
+    (0x21f2ca10, 0xc82d, 0x4da9, 0x9b, 0x89, 0x76, 0x2c, 0xb5, 0x64, 0xb5, 0xac));
+SRWLOCK providerLock = SRWLOCK_INIT;
+unsigned providerUsers = 0;
+
+void retainProvider() {
+  AcquireSRWLockExclusive(&providerLock);
+  if (!providerUsers++) TraceLoggingRegister(presentProvider);
+  ReleaseSRWLockExclusive(&providerLock);
+}
+
+void releaseProvider() {
+  AcquireSRWLockExclusive(&providerLock);
+  if (!--providerUsers) TraceLoggingUnregister(presentProvider);
+  ReleaseSRWLockExclusive(&providerLock);
+}
+
+struct TransferTrace {
+  bool enabled = TraceLoggingProviderEnabled(presentProvider, TRACE_LEVEL_INFORMATION, 1);
+  uint64_t stamp() const {
+    if (!enabled) return 0;
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+  }
+
+  uint64_t start = stamp(), locked = 0, ready = 0, copied = 0, bytes = 0;
+  HRESULT finish(D3DKMT_HANDLE allocation, bool publish, HRESULT hr) const {
+    if (enabled) {
+      const uint64_t end = stamp();
+      TraceLoggingWrite(presentProvider, "SurfaceTransfer",
+          TraceLoggingLevel(TRACE_LEVEL_INFORMATION), TraceLoggingKeyword(1),
+          TraceLoggingUInt32(allocation, "Allocation"), TraceLoggingBoolean(publish, "Publish"),
+          TraceLoggingUInt64(start, "StartQpc"), TraceLoggingUInt64(locked - start, "LockTicks"),
+          TraceLoggingUInt64(ready ? ready - locked : 0, "ReadyTicks"),
+          TraceLoggingUInt64(copied ? copied - ready : 0, "CopyTicks"),
+          TraceLoggingUInt64(copied ? end - copied : 0, "UnlockTicks"),
+          TraceLoggingUInt64(bytes, "Bytes"), TraceLoggingHResult(hr, "Status"));
+    }
+    return hr;
+  }
+};
+}
+
 static_assert(sizeof(qcdx_alloc) == 64);
 constexpr uint64_t maxSurfaceSize = 64ull << 20;
 
@@ -55,6 +103,10 @@ void RuntimeAllocation::swapIdentity(RuntimeAllocation& other) {
 }
 void RuntimeMemory::initialize(HANDLE rtDevice, const D3DDDI_DEVICECALLBACKS& cb,
                                const DXGI_DDI_BASE_CALLBACKS* dxgiCallbacks, bool allowPublish) {
+  if (!tracing) {
+    retainProvider();
+    tracing = true;
+  }
   device = rtDevice;
   dxgi = dxgiCallbacks;
   if (allowPublish) {
@@ -73,6 +125,12 @@ void RuntimeMemory::initialize(HANDLE rtDevice, const D3DDDI_DEVICECALLBACKS& cb
   callbacks.pfnCreateContextCb = cb.pfnCreateContextCb;
   callbacks.pfnDestroyContextCb = cb.pfnDestroyContextCb;
 }
+// A reentrant DestroyDevice may close the memory while a transfer is still
+// collecting its timestamps. Its caller pins the device until the DDI exits.
+RuntimeMemory::~RuntimeMemory() {
+  if (tracing && !processTerminating) releaseProvider();
+}
+
 HRESULT RuntimeMemory::allocate(RuntimeAllocation& out, HANDLE resource, UINT width, UINT height,
                                 DXGI_FORMAT format, bool primary) {
   if (!available() || out.surface || !resource || !width || !height ||
@@ -168,7 +226,8 @@ HRESULT RuntimeMemory::release(const std::shared_ptr<VidmmSurface>& binding) {
   return hr;
 }
 template<typename GetPixels>
-HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region, SharedReadGuard guard, GetPixels getPixels) {
+HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region,
+                                SharedReadGuard guard, GetPixels getPixels, SharedReadGuard* published) {
   auto binding = out.surface;
   if (!available() || !binding || binding->owner != this || !binding->handle) return E_INVALIDARG;
   if (binding->locked || binding->pendingLock) return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -177,34 +236,48 @@ HRESULT RuntimeMemory::transfer(RuntimeAllocation& out, bool publish, SurfaceTra
   D3DDDICB_LOCK2 map = {};
   map.hAllocation = binding->handle;
   binding->pendingLock = &map;
+  TransferTrace trace;
   HRESULT hr = callbacks.pfnLock2Cb(device, &map);
+  trace.locked = trace.stamp();
   binding->pendingLock = nullptr;
-  if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
-  if (FAILED(hr)) return hr;
+  if (binding->owner != this) return trace.finish(map.hAllocation, publish, DXGI_ERROR_DEVICE_REMOVED);
+  if (FAILED(hr)) return trace.finish(map.hAllocation, publish, hr);
   binding->locked = true;
   // Lock2 may reenter the DDI. Synchronize the renderable image only once
   // the runtime has returned and consume its pixels before calling Unlock2.
   D3D11_MAPPED_SUBRESOURCE pixels = {};
+  if (published) {
+    // The mapped image includes writes queued by Lock2. Snapshot their full
+    // extent before synchronizing, and retry only writes made after this point.
+    published->serial = published->state->writeSerial;
+    region.bounds = out.clip(published->state->damage);
+  }
   hr = (map.pData && hr == S_OK) ? getPixels(pixels) : E_FAIL;
-  if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
-  if (hr == S_OK && !guard.current()) hr = DXGI_ERROR_WAS_STILL_DRAWING;
+  trace.ready = trace.stamp();
+  if (binding->owner != this) return trace.finish(map.hAllocation, publish, DXGI_ERROR_DEVICE_REMOVED);
+  if (hr == S_OK && (!guard.current() || (published && !published->current())))
+    hr = DXGI_ERROR_WAS_STILL_DRAWING;
   if (hr == S_OK && (!pixels.pData || pixels.RowPitch < rowBytes(binding->layout)))
     hr = E_INVALIDARG;
   if (hr == S_OK) {
     const auto& layout = binding->layout;
     region.forEach([&](SurfaceRect area) {
+      if (trace.enabled)
+        trace.bytes += uint64_t(area.right - area.left) * (area.bottom - area.top) * pixelBytes(layout);
       if (publish)
         copySurfaceRect(map.pData, layout.pitch, pixels.pData, pixels.RowPitch, pixelBytes(layout), area);
       else
         copySurfaceRect(pixels.pData, pixels.RowPitch, map.pData, layout.pitch, pixelBytes(layout), area);
     });
   }
+  trace.copied = trace.stamp();
   D3DDDICB_UNLOCK2 unlock = {};
   unlock.hAllocation = binding->handle;
   binding->locked = false;
   auto result = callbacks.pfnUnlock2Cb(device, &unlock);
-  if (binding->owner != this) return DXGI_ERROR_DEVICE_REMOVED;
-  return FAILED(result) ? result : hr;
+  if (binding->owner != this) hr = DXGI_ERROR_DEVICE_REMOVED;
+  else if (FAILED(result)) hr = result;
+  return trace.finish(map.hAllocation, publish, hr);
 }
 HRESULT RuntimeMemory::upload(RuntimeAllocation& out, const void* data, UINT pitch, SurfaceRect area) {
   if (!data || !out.surface || pitch < rowBytes(out.surface->layout)) return E_INVALIDARG;
@@ -363,7 +436,8 @@ HRESULT RuntimeMemory::publishGpu(RuntimeAllocation& out, ID3D11DeviceContext* c
 }
 
 HRESULT RuntimeMemory::transferImage(RuntimeAllocation& out, ID3D11DeviceContext* context,
-                                    ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard) {
+                                    ID3D11Texture2D* image, bool publish, SurfaceTransfer region,
+                                    SharedReadGuard guard, SharedReadGuard* published) {
   if (publish) {
     const auto allocation = out.handle();
     if (!available() || !allocation) return DXGI_ERROR_DEVICE_REMOVED;
@@ -380,7 +454,7 @@ HRESULT RuntimeMemory::transferImage(RuntimeAllocation& out, ID3D11DeviceContext
   }
   return transfer(out, publish, region, guard, [&](D3D11_MAPPED_SUBRESOURCE& pixels) {
     return getSharedImageMapping(context, image, publish, &pixels);
-  });
+  }, published);
 }
 HRESULT RuntimeMemory::setDisplayMode(RuntimeAllocation& out, const Live& live) {
   if (!available() || !live()) return DXGI_ERROR_DEVICE_REMOVED;

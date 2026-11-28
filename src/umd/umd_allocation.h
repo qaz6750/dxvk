@@ -50,6 +50,10 @@ private:
 
 class RuntimeMemory {
 public:
+  RuntimeMemory() = default;
+  RuntimeMemory(const RuntimeMemory&) = delete;
+  RuntimeMemory& operator=(const RuntimeMemory&) = delete;
+  ~RuntimeMemory();
   using Live = std::function<bool()>;
   void initialize(HANDLE device, const D3DDDI_DEVICECALLBACKS& callbacks,
                   const DXGI_DDI_BASE_CALLBACKS* dxgi, bool gpuPublish = false);
@@ -61,7 +65,8 @@ public:
   HRESULT upload(RuntimeAllocation& out, const void* data, UINT pitch, SurfaceRect area = SurfaceRect::full());
   HRESULT download(RuntimeAllocation& out, void* data, UINT pitch, SurfaceTransfer region, SharedReadGuard guard);
   HRESULT transferImage(RuntimeAllocation& out, ID3D11DeviceContext* context,
-                        ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard);
+                        ID3D11Texture2D* image, bool publish, SurfaceTransfer region, SharedReadGuard guard,
+                        SharedReadGuard* published = nullptr);
   HRESULT setDisplayMode(RuntimeAllocation& primary, const Live& live);
   HRESULT present(RuntimeAllocation& source, const DXGI_DDI_ARG_PRESENT& args,
                   const Live& live, D3DKMT_HANDLE destination);
@@ -74,7 +79,8 @@ private:
   friend class RuntimeAllocation;
   HRESULT ensureContext(const Live& live);
   template<typename GetPixels>
-  HRESULT transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region, SharedReadGuard guard, GetPixels getPixels);
+  HRESULT transfer(RuntimeAllocation& out, bool publish, SurfaceTransfer region, SharedReadGuard guard, GetPixels getPixels,
+                   SharedReadGuard* published = nullptr);
   HRESULT publishGpu(RuntimeAllocation& out, ID3D11DeviceContext* context, ID3D11Texture2D* image, SurfaceRect area);
   HRESULT createPublishSource(VidmmSurface& binding, const D3D11_MAPPED_SUBRESOURCE& pixels);
   HRESULT dropPublishSource(VidmmSurface& binding);
@@ -86,6 +92,6 @@ private:
   const DXGI_DDI_BASE_CALLBACKS* dxgi = nullptr;
   std::list<std::shared_ptr<VidmmSurface>> surfaces;
   D3DDDICB_CREATECONTEXT* pendingContext = nullptr;
-  bool closing = false;
+  bool closing = false, tracing = false;
 };
 }

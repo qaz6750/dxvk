@@ -62,7 +62,8 @@ inline HRESULT copySharedSurface(ID3D11Device* device, ID3D11DeviceContext* cont
 // the staging hop, the synchronized map that acts as the GPU barrier and the
 // balancing unmap are identical, and only the order of the two copies differs.
 inline HRESULT transferSharedSurface(ID3D11Device* device, ID3D11DeviceContext* context,
-    RuntimeMemory& memory, SharedSurface& surface, bool publish, SurfaceTransfer region, SharedReadGuard guard = {}) {
+    RuntimeMemory& memory, SharedSurface& surface, bool publish, SurfaceTransfer region, SharedReadGuard guard = {},
+    SharedReadGuard* published = nullptr) {
   if (!device || !context || !surface.cache || !surface.allocation.handle())
     return E_INVALIDARG;
   region.bounds = surface.allocation.clip(region.bounds);
@@ -73,7 +74,7 @@ inline HRESULT transferSharedSurface(ID3D11Device* device, ID3D11DeviceContext* 
     ~TransferScope() { active = false; }
   } transferScope{surface.transferring};
   if (hasSharedImageMapping(surface.cache.Get())) {
-    HRESULT hr = memory.transferImage(surface.allocation, context, surface.cache.Get(), publish, region, guard);
+    HRESULT hr = memory.transferImage(surface.allocation, context, surface.cache.Get(), publish, region, guard, published);
     if (hr == S_OK && publish) {
       static const bool reported = [] {
         OutputDebugStringA("[qcdx_dxvk] Published mapped linear image to VidMM\n");
@@ -114,10 +115,11 @@ inline HRESULT publishSharedSurface(ID3D11Device* device, ID3D11DeviceContext* c
   // Replay a write made by a lock callback once. If callbacks keep writing,
   // leave the accumulated damage intact and let the caller retry the handoff.
   for (unsigned attempt = 0; attempt < 2; ++attempt) {
-    const auto serial = surface.state.writeSerial;
-    const HRESULT hr = transferSharedSurface(device, context, memory, surface, true, {surface.state.damage, {}});
+    SharedReadGuard snapshot{&surface.state, surface.state.writeSerial};
+    const HRESULT hr = transferSharedSurface(device, context, memory, surface, true, {surface.state.damage, {}}, {}, &snapshot);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING && !snapshot.current()) continue;
     if (hr != S_OK) return hr;
-    if (serial == surface.state.writeSerial) {
+    if (snapshot.current()) {
       sharedPublished(surface.state, epoch);
       return S_OK;
     }

@@ -21,6 +21,7 @@ d3d9_src = [
   'd3d9_adapter.cpp',
   'd3d9_monitor.cpp',
   'd3d9_device.cpp',
+  'd3d9_device_native.cpp',
   'd3d9_state.cpp',
   'd3d9_cursor.cpp',
   'd3d9_swapchain.cpp',

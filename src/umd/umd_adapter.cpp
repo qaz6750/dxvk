@@ -84,6 +84,7 @@ static HRESULT openAdapter(D3D10DDIARG_OPENADAPTER* args, Table* output) {
     auto identity = std::make_shared<dxvk::umd::AdapterIdentity>();
     identity->luid = luid;
     identity->gpuPublish = (features & QCDX_CAP_GPU_PUBLISH) != 0;
+    identity->scanoutGamma = (features & QCDX_CAP_SCANOUT_GAMMA) != 0;
     std::lock_guard lock(adaptersMutex);
     if (!nextToken) return E_OUTOFMEMORY;
     auto token = reinterpret_cast<void*>(nextToken++);

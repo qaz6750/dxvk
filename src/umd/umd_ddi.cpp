@@ -77,6 +77,7 @@ struct Device {
   const D3D11DDI_CORELAYER_DEVICECALLBACKS* callbacks11 = nullptr;
   D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_10_0;
   bool nativeTable11 = false;
+  bool scanoutGamma = false;
   D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
   dxvk::umd::RuntimeMemory memory;
   bool graphicsShadersReady = false;
@@ -3078,10 +3079,15 @@ HRESULT APIENTRY getGammaCaps(DXGI_DDI_ARG_GET_GAMMA_CONTROL_CAPS* args) {
   if (!args || !args->hDevice || !args->pGammaCapabilities) return E_INVALIDARG;
   DeviceOperation operation(reinterpret_cast<void*>(args->hDevice));
   if (!operation.owner || operation.owner->retired) return DXGI_ERROR_DEVICE_REMOVED;
-  // The current identity ABI has no queried gamma capability reply. Leave
-  // the caller's output intact, including guarded storage, rather than invent
-  // a curve from static KMD code. Gamma programming belongs to the KMD path.
-  return DXGI_DDI_ERR_UNSUPPORTED;
+  if (!operation.owner->scanoutGamma) return DXGI_DDI_ERR_UNSUPPORTED;
+  auto& caps = *args->pGammaCapabilities;
+  caps = {};
+  caps.ScaleAndOffsetSupported = TRUE;
+  caps.MaxConvertedValue = 1.0f;
+  caps.NumGammaControlPoints = 256;
+  for (UINT i = 0; i < caps.NumGammaControlPoints; ++i)
+    caps.ControlPointPositions[i] = float(i) / 255.0f;
+  return S_OK;
 }
 
 HRESULT APIENTRY present(DXGI_DDI_ARG_PRESENT* args) {
@@ -3301,6 +3307,7 @@ HRESULT createDdiDevice(const dxvk::umd::AdapterIdentity& adapter, D3D10DDIARG_C
   auto device = owner.get();
   device->runtime = native->hRTCoreLayer;
   device->nativeTable11 = isD3D11;
+  device->scanoutGamma = adapter.scanoutGamma;
   if constexpr (isD3D11) device->callbacks11 = callbacks;
   else device->callbacks10 = callbacks;
   device->memory.initialize(native->hRTDevice.handle, *native->pKTCallbacks,

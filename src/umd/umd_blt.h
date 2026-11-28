@@ -107,11 +107,11 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
     return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
   }
   D3D11_TEXTURE2D_DESC sourceDesc{};
+  source->GetDesc(&sourceDesc);
   bool encodedShaderResolve = false;
   bool decodedSrgbResolve = false;
   ComPtr<ID3D11ShaderResourceView> resolveSrv;
   if (plan.resolve) {
-    source->GetDesc(&sourceDesc);
     if (sourceDesc.Format != plan.sourceFormat
         && sourceDesc.Format != presentCacheFormat(plan.sourceFormat)) {
       if (!copyFormatsCompatible(sourceDesc.Format, plan.sourceFormat))
@@ -185,9 +185,31 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   scratchDesc.Format = plan.sourceFormat; scratchDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
   if (encodedShaderResolve) scratchDesc.BindFlags |= D3D11_BIND_RENDER_TARGET;
   ComPtr<ID3D11Texture2D> sampled, rendered, encodedMultisample;
-  hr = device->CreateTexture2D(&scratchDesc, nullptr, &sampled);
-  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
-  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  ComPtr<ID3D11ShaderResourceView> srv;
+  // Read encoded texels directly when the source admits the same 2D view
+  // as the scratch image. A self-blit still needs a snapshot.
+  if (!plan.resolve && source != destination && sourceDesc.ArraySize == 1
+      && (sourceDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+      && !(sourceDesc.MiscFlags & D3D11_RESOURCE_MISC_RESOURCE_CLAMP)
+      && (sourceDesc.Format == plan.sourceFormat || sourceDesc.Format == presentCacheFormat(plan.sourceFormat))) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = plan.sourceFormat;
+    view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MostDetailedMip = sourceSubresource;
+    view.Texture2D.MipLevels = 1;
+    hr = device->CreateShaderResourceView(source, &view, &srv);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK && hr != E_INVALIDARG && hr != DXGI_ERROR_UNSUPPORTED)
+      return FAILED(hr) ? hr : E_FAIL;
+  }
+  if (!srv) {
+    hr = device->CreateTexture2D(&scratchDesc, nullptr, &sampled);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK || !sampled) return FAILED(hr) ? hr : E_FAIL;
+    hr = device->CreateShaderResourceView(sampled.Get(), nullptr, &srv);
+    if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
+    if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
+  }
   if (plan.resolve && !encodedShaderResolve) {
     // Fully typed sRGB cannot ResolveSubresource under a UNORM format. Copy
     // the same-family physical samples first; this changes no color values.
@@ -205,7 +227,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
       if (!encodedMultisample) return E_FAIL;
     }
   }
-  ComPtr<ID3D11ShaderResourceView> srv; ComPtr<ID3D11RenderTargetView> rtv;
+  ComPtr<ID3D11RenderTargetView> rtv;
   ComPtr<ID3D11RenderTargetView> resolveRtv;
   if (encodedShaderResolve) {
     hr = device->CreateRenderTargetView(sampled.Get(), nullptr, &resolveRtv);
@@ -213,15 +235,10 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
     if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
     if (!resolveSrv || !resolveRtv) return E_FAIL;
   }
-  hr = device->CreateShaderResourceView(sampled.Get(), nullptr, &srv);
-  if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
-  if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
-  // For a full-surface blit the viewport already matches the destination.
-  // Use a linear view so sRGB backbuffers receive the same encoded bytes.
+  // A linear RTV preserves the encoded bytes even for sRGB backbuffers.
   D3D11_TEXTURE2D_DESC dstDesc{};
   destination->GetDesc(&dstDesc);
-  if (!destinationSubresource && dstDesc.ArraySize == 1 && !left && !top
-      && dstDesc.Width == plan.width && dstDesc.Height == plan.height
+  if (!destinationSubresource && dstDesc.ArraySize == 1
       && !presentX8Format(plan.destinationFormat)
       && (dstDesc.Format == plan.destinationFormat
         || dstDesc.Format == presentCacheFormat(plan.destinationFormat))) {
@@ -262,7 +279,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   hr = device->CreateDeferredContext(0, &commands);
   if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
-  if (!vs || !ps || !layout || !vb || !sampled || !srv || !rtv || !sampler || !raster || !commands)
+  if (!vs || !ps || !layout || !vb || !srv || !rtv || !sampler || !raster || !commands)
     return E_FAIL;
   if (encodedMultisample) commands->CopySubresourceRegion(encodedMultisample.Get(), 0,
     0, 0, 0, source, sourceSubresource, nullptr);
@@ -284,7 +301,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   } else if (plan.resolve) commands->ResolveSubresource(sampled.Get(), 0,
     encodedMultisample ? encodedMultisample.Get() : source,
     encodedMultisample ? 0 : sourceSubresource, plan.sourceFormat);
-  else commands->CopySubresourceRegion(sampled.Get(), 0, 0, 0, 0, source, sourceSubresource, nullptr);
+  else if (sampled) commands->CopySubresourceRegion(sampled.Get(), 0, 0, 0, 0, source, sourceSubresource, nullptr);
   ID3D11Buffer* buffers[] = {vb.Get()}; const UINT stride = sizeof(BltVertex), offset = 0;
   commands->IASetInputLayout(layout.Get()); commands->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
   commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -293,7 +310,8 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   commands->PSSetShaderResources(0, 1, views); commands->PSSetSamplers(0, 1, samplers);
   ID3D11RenderTargetView* targets[] = {rtv.Get()}; commands->OMSetRenderTargets(1, targets, nullptr);
   commands->RSSetState(raster.Get());
-  const D3D11_VIEWPORT viewport{0, 0, FLOAT(plan.width), FLOAT(plan.height), 0, 1};
+  const D3D11_VIEWPORT viewport{rendered ? 0.f : FLOAT(left), rendered ? 0.f : FLOAT(top),
+    FLOAT(plan.width), FLOAT(plan.height), 0, 1};
   commands->RSSetViewports(1, &viewport); commands->Draw(3, 0);
   if (rendered)
     commands->CopySubresourceRegion(destination, destinationSubresource, left, top, 0, rendered.Get(), 0, nullptr);

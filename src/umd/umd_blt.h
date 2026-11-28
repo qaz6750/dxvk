@@ -1,6 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 #include "umd_blt_shader.h"
+#include "umd_shared_policy.h"
 #include "umd_private_transfer.h"
 #include "umd_encoded_resolve_shader.h"
 #include "umd_present_format.h"
@@ -31,6 +32,8 @@ struct BltPlan {
   DXGI_FORMAT sourceFormat = DXGI_FORMAT_UNKNOWN, destinationFormat = DXGI_FORMAT_UNKNOWN;
   bool resolve = false;
   bool directCopy = false;
+  bool cropped = false;
+  D3D11_BOX sourceBox{};
 };
 
 // The original DDI bind metadata is validated separately. Reject unsupported
@@ -39,7 +42,7 @@ struct BltPlan {
 inline HRESULT bltPlan(const D3D11_TEXTURE2D_DESC& src,
     const D3D11_TEXTURE2D_DESC& dst, UINT sourceSubresource, UINT destinationSubresource,
     UINT left, UINT top, UINT right, UINT bottom, UINT flags, UINT rotation,
-    BltPlan& output) {
+    BltPlan& output, SurfaceRect rect = SurfaceRect::full()) {
   if ((flags & ~15u) || rotation < 1 || rotation > 4
       || !src.Width || !src.Height || !dst.Width || !dst.Height
       || src.Width > 16384 || src.Height > 16384 || dst.Width > 16384 || dst.Height > 16384
@@ -68,6 +71,15 @@ inline HRESULT bltPlan(const D3D11_TEXTURE2D_DESC& src,
   if (src.Format != dst.Format && !(flags & 2)) return E_INVALIDARG;
   staged.sourceWidth = std::max(1u, src.Width >> (sourceSubresource % src.MipLevels));
   staged.sourceHeight = std::max(1u, src.Height >> (sourceSubresource % src.MipLevels));
+  if (!rect.isFull()) {
+    if (rect.empty() || rect.right > staged.sourceWidth || rect.bottom > staged.sourceHeight) return E_INVALIDARG;
+    staged.cropped = rect.left || rect.top || rect.right != staged.sourceWidth || rect.bottom != staged.sourceHeight;
+    // D3D11 resolves operate on a whole multisampled subresource.
+    if (staged.resolve && staged.cropped) return DXGI_ERROR_UNSUPPORTED;
+    staged.sourceBox = {rect.left, rect.top, 0, rect.right, rect.bottom, 1};
+    staged.sourceWidth = rect.right - rect.left;
+    staged.sourceHeight = rect.bottom - rect.top;
+  }
   staged.width = right - left; staged.height = bottom - top;
   const bool swapped = rotation == 2 || rotation == 4;
   if (!(flags & 4) && (staged.width != (swapped ? staged.sourceHeight : staged.sourceWidth)
@@ -94,16 +106,17 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
     UINT destinationSubresource, UINT left, UINT top, UINT rotation, const BltPlan& plan, const Live& live) {
   using Microsoft::WRL::ComPtr;
   if (!device || !context || !source || !destination) return E_INVALIDARG;
-  if (plan.directCopy) {
+  const bool selfCopy = source == destination && sourceSubresource == destinationSubresource;
+  if (plan.directCopy && !(selfCopy && plan.cropped)) {
     // Validated identity rectangles cover the whole source mip. When both
     // handles name the very same subresource, bounds force left=top=0 and the
     // operation is already complete. Never issue an illegal self-copy.
-    if (source == destination && sourceSubresource == destinationSubresource)
+    if (selfCopy)
       return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
     if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
     UnpredicatedTransfer transfer(context);
     context->CopySubresourceRegion(destination, destinationSubresource, left, top, 0,
-      source, sourceSubresource, nullptr);
+      source, sourceSubresource, plan.cropped ? &plan.sourceBox : nullptr);
     return live() ? device->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
   }
   D3D11_TEXTURE2D_DESC sourceDesc{};
@@ -188,7 +201,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   ComPtr<ID3D11ShaderResourceView> srv;
   // Read encoded texels directly when the source admits the same 2D view
   // as the scratch image. A self-blit still needs a snapshot.
-  if (!plan.resolve && source != destination && sourceDesc.ArraySize == 1
+  if (!plan.cropped && !plan.resolve && source != destination && sourceDesc.ArraySize == 1
       && (sourceDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
       && !(sourceDesc.MiscFlags & D3D11_RESOURCE_MISC_RESOURCE_CLAMP)
       && (sourceDesc.Format == plan.sourceFormat || sourceDesc.Format == presentCacheFormat(plan.sourceFormat))) {
@@ -282,7 +295,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   if (!vs || !ps || !layout || !vb || !srv || !rtv || !sampler || !raster || !commands)
     return E_FAIL;
   if (encodedMultisample) commands->CopySubresourceRegion(encodedMultisample.Get(), 0,
-    0, 0, 0, source, sourceSubresource, nullptr);
+    0, 0, 0, source, sourceSubresource, plan.cropped ? &plan.sourceBox : nullptr);
   // UNORM interpretation averages encoded samples, never decoded colors.
   if (encodedShaderResolve) {
     ID3D11Buffer* resolveBuffers[] = {vb.Get()}; const UINT resolveStride = sizeof(BltVertex), resolveOffset = 0;
@@ -301,7 +314,7 @@ inline HRESULT bltTexture2D(ID3D11Device* device, ID3D11DeviceContext* context,
   } else if (plan.resolve) commands->ResolveSubresource(sampled.Get(), 0,
     encodedMultisample ? encodedMultisample.Get() : source,
     encodedMultisample ? 0 : sourceSubresource, plan.sourceFormat);
-  else if (sampled) commands->CopySubresourceRegion(sampled.Get(), 0, 0, 0, 0, source, sourceSubresource, nullptr);
+  else if (sampled) commands->CopySubresourceRegion(sampled.Get(), 0, 0, 0, 0, source, sourceSubresource, plan.cropped ? &plan.sourceBox : nullptr);
   ID3D11Buffer* buffers[] = {vb.Get()}; const UINT stride = sizeof(BltVertex), offset = 0;
   commands->IASetInputLayout(layout.Get()); commands->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
   commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

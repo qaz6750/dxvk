@@ -73,6 +73,8 @@ public:
   HRESULT present9(RuntimeAllocation& source, const Live& live);
   HRESULT queryResidency(const D3DKMT_HANDLE* handles, UINT count,
                          D3DDDI_RESIDENCYSTATUS* status, const Live& live);
+  HRESULT offer(const D3DDDICB_OFFERALLOCATIONS& request);
+  HRESULT reclaim(const D3DDDICB_RECLAIMALLOCATIONS& request);
   HRESULT setPriority(D3DKMT_HANDLE allocation, UINT priority, const Live& live);
   HRESULT closeDeviceAllocations();
 private:

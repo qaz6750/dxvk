@@ -130,7 +130,8 @@ constexpr bool buffer11Desc(const D3D11DDIARG_CREATERESOURCE& native, D3D11_BUFF
   return true;
 }
 
-inline D3D11_BLEND_DESC blend11Desc(const D3D10_1_DDI_BLEND_DESC& native) {
+template<typename Desc>
+inline D3D11_BLEND_DESC blend11Desc(const Desc& native) {
   D3D11_BLEND_DESC out = {};
   out.AlphaToCoverageEnable = native.AlphaToCoverageEnable;
   out.IndependentBlendEnable = native.IndependentBlendEnable;

@@ -35,6 +35,7 @@
 #include "umd_private_children.h"
 
 #include <wrl/client.h>
+#include <d3d11_1.h>
 #include <d3d9.h> // Official S_NOT_RESIDENT / S_RESIDENT_IN_SHARED_MEMORY HRESULTs.
 #include <cstring>
 #include <memory>
@@ -63,6 +64,7 @@ struct Device {
   std::shared_ptr<dxvk::umd::RuntimeService> service = std::make_shared<dxvk::umd::RuntimeService>();
   ComPtr<ID3D11Device> backend;
   ComPtr<ID3D11DeviceContext> context;
+  ComPtr<ID3D11DeviceContext1> context1;
   ComPtr<ID3D11Query> predicate;
   ComPtr<ID3D11Texture2D> rotationScratch;
   std::atomic<bool> rotationActive{false};
@@ -131,7 +133,7 @@ struct Device {
       service->drain([&] {
         for (auto& bindings : classBindings) { bindings.pointers.clear(); bindings.owners.clear(); }
         inputLayout.reset();
-        rotationScratch.Reset(); predicate.Reset(); context.Reset(); backend.Reset();
+        rotationScratch.Reset(); predicate.Reset(); context1.Reset(); context.Reset(); backend.Reset();
       });
     } catch (...) { result = E_FAIL; }
     try {
@@ -203,8 +205,10 @@ struct DeviceOperation {
 };
 thread_local DeviceOperation* DeviceOperation::current = nullptr;
 void APIENTRY flush(D3D10DDI_HDEVICE h);
+BOOL APIENTRY flush1(D3D10DDI_HDEVICE h, UINT flags);
 template<auto function> constexpr bool isFlushEntry = false;
 template<> constexpr bool isFlushEntry<&flush> = true;
+template<> constexpr bool isFlushEntry<&flush1> = true;
 
 // All published D3D device entries pass through this typed WDK-ABI wrapper.
 // Thread-local operation lookup preserves the old owner when a callback
@@ -217,7 +221,8 @@ struct DeviceEntry<Result (APIENTRY *)(D3D10DDI_HDEVICE, Args...), function, pre
     DeviceOperation operation(h.pDrvPrivate);
     if (!operation.owner) {
       if constexpr (std::is_void_v<Result>) return;
-      // The sole BOOL entry is IsStagingBusy; a retired owner is not ready.
+      // A retired owner cannot flush and its staging resources are busy.
+      else if constexpr (isFlushEntry<function>) return FALSE;
       else if constexpr (std::is_same_v<Result, BOOL>) return TRUE;
       else return Result{};
     }
@@ -244,15 +249,17 @@ struct DeviceEntry<Result (APIENTRY *)(D3D10DDI_HDEVICE, Args...), function, pre
           uint64_t epoch;
           do {
             epoch = service->retirementEpoch();
-            service->run(backend);
+            if constexpr (std::is_void_v<Result>) service->run(backend);
+            else if (!service->run(backend)) return FALSE;
           } while (!operation.owner->retired && epoch != service->retirementEpoch());
-          return;
+          if constexpr (!std::is_void_v<Result>) return !operation.owner->retired;
         } else return operation.owner->service->run(backend);
       } catch (...) {
         // Amortized processing can destroy the device and invalidate its
         // runtime callback table before an exception reaches this wrapper.
         if (!operation.owner->retired) operation.owner->error(DXGI_ERROR_DEVICE_REMOVED);
         if constexpr (std::is_void_v<Result>) return;
+        else if constexpr (isFlushEntry<function>) return FALSE;
         else if constexpr (std::is_same_v<Result, BOOL>) return TRUE;
         else return Result{};
       }
@@ -1547,8 +1554,8 @@ bool subresourceBox(const SubresourceInfo& info, const D3D10_DDI_BOX* input, D3D
   return box.left <= box.right && box.top <= box.bottom && box.front <= box.back
       && box.right <= width && box.bottom <= height && box.back <= info.depth;
 }
-void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstIndex,
-    UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT srcIndex, const D3D10_DDI_BOX* input) {
+void APIENTRY copyRegion1(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstIndex,
+    UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT srcIndex, const D3D10_DDI_BOX* input, UINT flags) {
   auto device = get(h);
   if (!owned(device, get(dst)) || !owned(device, get(src))) return;
   // The DDI defines reversed as well as equal bounds as an empty no-op.
@@ -1571,7 +1578,7 @@ void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstInd
     device->error(E_INVALIDARG); return;
   }
   if (box.left == box.right || box.top == box.bottom || box.front == box.back) return;
-  if ((get(src)->backend.Get() == get(dst)->backend.Get() && srcIndex == dstIndex)
+  if ((!device->context1 && get(src)->backend.Get() == get(dst)->backend.Get() && srcIndex == dstIndex)
       || ((source.blockBytes || destination.blockBytes)
         && (source.dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D
           || source.blockBytes != destination.blockBytes || source.samples != 1 || destination.samples != 1
@@ -1611,13 +1618,21 @@ void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstInd
         bridge.Get(), srcIndex, input ? &box : nullptr);
       return;
     }
-    device->context->CopySubresourceRegion(get(dst)->backend.Get(), dstIndex, x, y, z,
-      get(src)->backend.Get(), srcIndex, input ? &box : nullptr);
+    if (device->context1)
+      device->context1->CopySubresourceRegion1(get(dst)->backend.Get(), dstIndex, x, y, z,
+        get(src)->backend.Get(), srcIndex, input ? &box : nullptr, flags);
+    else
+      device->context->CopySubresourceRegion(get(dst)->backend.Get(), dstIndex, x, y, z,
+        get(src)->backend.Get(), srcIndex, input ? &box : nullptr);
   } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
     catch (...) { device->error(E_FAIL); }
 }
-void APIENTRY updateResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT index,
-    const D3D10_DDI_BOX* input, const void* source, UINT rowPitch, UINT depthPitch) {
+void APIENTRY copyRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstIndex,
+    UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT srcIndex, const D3D10_DDI_BOX* box) {
+  copyRegion1(h, dst, dstIndex, x, y, z, src, srcIndex, box, 0);
+}
+void APIENTRY updateResource1(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT index,
+    const D3D10_DDI_BOX* input, const void* source, UINT rowPitch, UINT depthPitch, UINT flags) {
   auto device = get(h);
   if (!owned(device, get(dst))) return;
   if (input && (input->left >= input->right || input->top >= input->bottom
@@ -1626,7 +1641,7 @@ void APIENTRY updateResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT in
   if (!subresourceInfo(get(dst), index, destination, true) || destination.usage != D3D11_USAGE_DEFAULT
       || (destination.bindings & D3D11_BIND_DEPTH_STENCIL)
       || !subresourceBox(destination, input, box)
-      || (input && (destination.bindings & D3D11_BIND_CONSTANT_BUFFER))) {
+      || (input && (destination.bindings & D3D11_BIND_CONSTANT_BUFFER) && (!device->context1 || ((box.left | box.right) & 15)))) {
     device->error(E_INVALIDARG); return;
   }
   if (box.left == box.right || box.top == box.bottom || box.front == box.back) return;
@@ -1652,10 +1667,16 @@ void APIENTRY updateResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT in
   if (replacesDestination) wroteSharedSurface(device, get(dst)->shared);
   else if (!wroteSharedRegion(device, get(dst)->shared, {box.left, box.top, box.right, box.bottom})) return;
   try {
-    device->context->UpdateSubresource(get(dst)->backend.Get(), index, input ? &box : nullptr,
+    if (device->context1) device->context1->UpdateSubresource1(get(dst)->backend.Get(), index, input ? &box : nullptr,
+      source, rowPitch, depthPitch, flags);
+    else device->context->UpdateSubresource(get(dst)->backend.Get(), index, input ? &box : nullptr,
       source, rowPitch, depthPitch);
   } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
     catch (...) { device->error(E_FAIL); }
+}
+void APIENTRY updateResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT index,
+    const D3D10_DDI_BOX* input, const void* source, UINT rowPitch, UINT depthPitch) {
+  updateResource1(h, dst, index, input, source, rowPitch, depthPitch, 0);
 }
 void APIENTRY mapResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE resource,
     UINT subresource, D3D10_DDI_MAP type, UINT flags, D3D10DDI_MAPPED_SUBRESOURCE* out) {
@@ -1725,13 +1746,15 @@ void APIENTRY unmapResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE resource, UIN
   catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
   catch (...) { device->error(E_FAIL); }
 }
-SIZE_T APIENTRY shaderSize(D3D10DDI_HDEVICE, const UINT*, const D3D10DDIARG_STAGE_IO_SIGNATURES*) {
+template<typename Signature>
+SIZE_T APIENTRY shaderSize(D3D10DDI_HDEVICE, const UINT*, const Signature*) {
   return sizeof(Shader);
 }
 HRESULT createNativeShader10(Device* device, const UINT* code, D3D10DDI_HSHADER output,
     dxvk::umd::ShaderStage stage, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature);
+template<typename Entry>
 void signatureOrdinals11(std::vector<dxvk::umd::ShaderIo11>& decoded,
-    const D3D10DDIARG_SIGNATURE_ENTRY* entries, UINT count);
+    const Entry* entries, UINT count);
 void createShader(D3D10DDI_HDEVICE h, const UINT* code, D3D10DDI_HSHADER out,
     const D3D10DDIARG_STAGE_IO_SIGNATURES* signature, dxvk::umd::ShaderStage stage,
     const D3D10DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT* streamOutput = nullptr) {
@@ -1884,8 +1907,8 @@ void APIENTRY destroyShader(D3D10DDI_HDEVICE h, D3D10DDI_HSHADER shader) {
     object->hull, object->domain, object->linkage);
 }
 template<dxvk::umd::ShaderStage Stage>
-void APIENTRY setConstantBuffers(D3D10DDI_HDEVICE h, UINT start, UINT count,
-    const D3D10DDI_HRESOURCE* resources) {
+void APIENTRY setConstantBuffers1(D3D10DDI_HDEVICE h, UINT start, UINT count,
+    const D3D10DDI_HRESOURCE* resources, const UINT* first, const UINT* lengths) {
   auto device = get(h);
   constexpr UINT slots = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
   if (start > slots || count > slots - start || (count && !resources)) {
@@ -1905,6 +1928,15 @@ void APIENTRY setConstantBuffers(D3D10DDI_HDEVICE h, UINT start, UINT count,
   // Validate every resource before changing state, so an invalid tail cannot
   // leave a partially updated binding range. Null entries explicitly unbind.
   try {
+    if (first || lengths) {
+      if constexpr (Stage == dxvk::umd::ShaderStage::Vertex) device->context1->VSSetConstantBuffers1(start, count, buffers, first, lengths);
+      else if constexpr (Stage == dxvk::umd::ShaderStage::Geometry) device->context1->GSSetConstantBuffers1(start, count, buffers, first, lengths);
+      else if constexpr (Stage == dxvk::umd::ShaderStage::Hull) device->context1->HSSetConstantBuffers1(start, count, buffers, first, lengths);
+      else if constexpr (Stage == dxvk::umd::ShaderStage::Domain) device->context1->DSSetConstantBuffers1(start, count, buffers, first, lengths);
+      else if constexpr (Stage == dxvk::umd::ShaderStage::Compute) device->context1->CSSetConstantBuffers1(start, count, buffers, first, lengths);
+      else device->context1->PSSetConstantBuffers1(start, count, buffers, first, lengths);
+      return;
+    }
     if constexpr (Stage == dxvk::umd::ShaderStage::Vertex) device->context->VSSetConstantBuffers(start, count, buffers);
     else if constexpr (Stage == dxvk::umd::ShaderStage::Geometry) device->context->GSSetConstantBuffers(start, count, buffers);
     else if constexpr (Stage == dxvk::umd::ShaderStage::Hull) device->context->HSSetConstantBuffers(start, count, buffers);
@@ -1913,6 +1945,10 @@ void APIENTRY setConstantBuffers(D3D10DDI_HDEVICE h, UINT start, UINT count,
     else device->context->PSSetConstantBuffers(start, count, buffers);
   } catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
     catch (...) { device->error(E_FAIL); }
+}
+template<dxvk::umd::ShaderStage Stage>
+void APIENTRY setConstantBuffers(D3D10DDI_HDEVICE h, UINT start, UINT count, const D3D10DDI_HRESOURCE* resources) {
+  setConstantBuffers1<Stage>(h, start, count, resources, nullptr, nullptr);
 }
 // Validate before committing either the legacy or D3D11 output-merger state.
 struct RenderTargetBindings {
@@ -2034,14 +2070,32 @@ void APIENTRY setScissors(D3D10DDI_HDEVICE h, UINT count, UINT clear, const D3D1
   catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
   catch (...) { device->error(E_FAIL); }
 }
-SIZE_T APIENTRY rasterizerSize(D3D10DDI_HDEVICE, const D3D10_DDI_RASTERIZER_DESC*) { return sizeof(Rasterizer); }
-void APIENTRY createRasterizer(D3D10DDI_HDEVICE h, const D3D10_DDI_RASTERIZER_DESC* args,
+template<typename Desc>
+SIZE_T APIENTRY rasterizerSize(D3D10DDI_HDEVICE, const Desc*) { return sizeof(Rasterizer); }
+template<typename Desc>
+void APIENTRY createRasterizer(D3D10DDI_HDEVICE h, const Desc* args,
     D3D10DDI_HRASTERIZERSTATE out, D3D10DDI_HRTRASTERIZERSTATE) {
   auto device = get(h);
   if (!out.pDrvPrivate) { device->error(E_INVALIDARG); return; }
   auto object = new (out.pDrvPrivate) Rasterizer();
   object->owner = device;
   if (!args) { device->error(E_INVALIDARG); return; }
+  if constexpr (std::is_same_v<Desc, D3D11_1_DDI_RASTERIZER_DESC>) {
+    if (args->ForcedSampleCount) {
+      ComPtr<ID3D11Device1> backend;
+      ComPtr<ID3D11RasterizerState1> rasterizer;
+      D3D11_RASTERIZER_DESC1 desc = {D3D11_FILL_MODE(args->FillMode), D3D11_CULL_MODE(args->CullMode),
+        args->FrontCounterClockwise, args->DepthBias, args->DepthBiasClamp, args->SlopeScaledDepthBias,
+        args->DepthClipEnable, args->ScissorEnable, args->MultisampleEnable, args->AntialiasedLineEnable, args->ForcedSampleCount};
+      createChildBackend(device, object, [&]() -> HRESULT {
+        HRESULT hr = device->backend.As(&backend);
+        if (SUCCEEDED(hr)) hr = backend->CreateRasterizerState1(&desc, &rasterizer);
+        if (SUCCEEDED(hr)) object->backend = rasterizer;
+        return hr;
+      });
+      return;
+    }
+  }
   D3D11_RASTERIZER_DESC desc = {};
   desc.FillMode = static_cast<D3D11_FILL_MODE>(args->FillMode);
   desc.CullMode = static_cast<D3D11_CULL_MODE>(args->CullMode);
@@ -2379,7 +2433,7 @@ void APIENTRY drawIndexedInstanced(D3D10DDI_HDEVICE h, UINT count, UINT instance
   catch (const std::bad_alloc&) { device->error(E_OUTOFMEMORY); }
   catch (...) { device->error(E_FAIL); }
 }
-void APIENTRY flush(D3D10DDI_HDEVICE h) {
+BOOL flushDevice(D3D10DDI_HDEVICE h) {
   auto device = get(h);
   // DDI11's runtime no longer performs this work inside RenderCb. An empty
   // explicit Flush must still offer deferred runtime destruction a chance.
@@ -2392,11 +2446,15 @@ void APIENTRY flush(D3D10DDI_HDEVICE h) {
   // D3D10 Flush permits only device-removed reporting. Backend command
   // recording AND Vulkan queue submission must finish while its caller can
   // service runtime callbacks; GPU completion is deliberately asynchronous.
-  if (FAILED(published) || FAILED(dxvk::umd::flushRuntimeSubmission(device->context.Get())))
-    device->error(DXGI_ERROR_DEVICE_REMOVED);
+  const bool flushed = SUCCEEDED(published) && !device->retired
+    && SUCCEEDED(dxvk::umd::flushRuntimeSubmission(device->context.Get()));
+  if (!flushed && !device->retired) device->error(DXGI_ERROR_DEVICE_REMOVED);
   // Anything another process wrote before this point must be read again.
   openSharedEpoch(device);
+  return flushed;
 }
+void APIENTRY flush(D3D10DDI_HDEVICE h) { flushDevice(h); }
+BOOL APIENTRY flush1(D3D10DDI_HDEVICE h, UINT) { return flushDevice(h); }
 void APIENTRY relocateDeviceFunctions(D3D10DDI_HDEVICE h, D3D10DDI_DEVICEFUNCS* functions) {
   if (!functions) { get(h)->error(E_INVALIDARG); return; }
   // The runtime has already copied its table. No driver object caches a
@@ -2796,7 +2854,8 @@ HRESULT APIENTRY resolveSharedResource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE* args)
     catch (...) { return E_FAIL; }
 }
 
-HRESULT bltData(Device* device, const DXGI_DDI_ARG_BLT& request) {
+template<typename Request>
+HRESULT bltData(Device* device, const Request& request) {
   if (device->presentActive.exchange(true)) return DXGI_ERROR_WAS_STILL_DRAWING;
   struct BltScope {
     Device* device;
@@ -2842,10 +2901,13 @@ HRESULT bltData(Device* device, const DXGI_DDI_ARG_BLT& request) {
   source.image->GetDesc(&srcDesc); destination.image->GetDesc(&dstDesc);
   if (source.format != DXGI_FORMAT_UNKNOWN) srcDesc.Format = source.format;
   if (destination.format != DXGI_FORMAT_UNKNOWN) dstDesc.Format = destination.format;
+  SurfaceRect srcRect = SurfaceRect::full();
+  if constexpr (std::is_same_v<Request, DXGI_DDI_ARG_BLT1>)
+    srcRect = {request.SrcLeft, request.SrcTop, request.SrcRight, request.SrcBottom};
   dxvk::umd::BltPlan plan;
   HRESULT hr = dxvk::umd::bltPlan(srcDesc, dstDesc, request.SrcSubresource, request.DstSubresource,
     request.DstLeft, request.DstTop, request.DstRight, request.DstBottom,
-    request.Flags.Value, UINT(request.Rotate), plan);
+    request.Flags.Value, UINT(request.Rotate), plan, srcRect);
   if (hr != S_OK) return hr == DXGI_ERROR_UNSUPPORTED ? DXGI_DDI_ERR_UNSUPPORTED : hr;
   auto live = [&] {
     std::lock_guard<std::mutex> lock(resourceStorageMutex);
@@ -2860,7 +2922,7 @@ HRESULT bltData(Device* device, const DXGI_DDI_ARG_BLT& request) {
   };
   const auto epoch = device->sharedEpoch;
   if (source.shared) {
-    hr = dxvk::umd::refreshSharedSurface(backend.Get(), context.Get(), device->memory, *source.shared, epoch);
+    hr = dxvk::umd::refreshSharedSurface(backend.Get(), context.Get(), device->memory, *source.shared, epoch, srcRect);
     if (!live()) return DXGI_ERROR_DEVICE_REMOVED;
     if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
   }
@@ -2895,7 +2957,8 @@ HRESULT bltData(Device* device, const DXGI_DDI_ARG_BLT& request) {
   return S_OK;
 }
 
-HRESULT APIENTRY blt(DXGI_DDI_ARG_BLT* args) {
+template<typename Request>
+HRESULT APIENTRY blt(Request* args) {
   if (!args || !args->hDevice || !args->hSrcResource || !args->hDstResource) return E_INVALIDARG;
   const auto request = *args;
   DeviceOperation operation(reinterpret_cast<void*>(request.hDevice));
@@ -3120,9 +3183,13 @@ SIZE_T dxvk::umd::privateDeviceSize() { return sizeof(DevicePrivate); }
 namespace {
 #include "umd_d3d11_ddi.inl"
 #include "umd_d3d11_shader.inl"
+#include "umd_d3d11_1_ddi.inl"
 
 template<typename Table>
 void populateDeviceFunctions(Table* table) {
+  constexpr bool extended = std::is_same_v<Table, D3D11_1DDI_DEVICEFUNCS>;
+  using Signature = std::conditional_t<extended, D3D11_1DDIARG_STAGE_IO_SIGNATURES, D3D10DDIARG_STAGE_IO_SIGNATURES>;
+  using Raster = std::conditional_t<extended, D3D11_1_DDI_RASTERIZER_DESC, D3D10_DDI_RASTERIZER_DESC>;
   *table = {};
   table->pfnDestroyResource = deviceEntry<destroyResource>;
   table->pfnCalcPrivateOpenedResourceSize = deviceEntry<openedResourceSize>;
@@ -3153,9 +3220,21 @@ void populateDeviceFunctions(Table* table) {
   table->pfnResourceResolveSubresource = deviceEntry<resolveResource, true>;
   table->pfnCheckFormatSupport = deviceEntry<checkFormat>;
   table->pfnCheckMultisampleQualityLevels = deviceEntry<checkMultisample>;
-  table->pfnResourceCopyRegion = deviceEntry<copyRegion, true>;
-  table->pfnResourceUpdateSubresourceUP = deviceEntry<updateResource, true>;
-  table->pfnDefaultConstantBufferUpdateSubresourceUP = deviceEntry<updateResource, true>;
+  if constexpr (extended) {
+    table->pfnResourceCopyRegion = deviceEntry<copyRegion1, true>;
+    table->pfnResourceUpdateSubresourceUP = deviceEntry<updateResource1, true>;
+    table->pfnDefaultConstantBufferUpdateSubresourceUP = deviceEntry<updateResource1, true>;
+    table->pfnFlush = deviceEntry<flush1>;
+    table->pfnDiscard = deviceEntry<discardView>;
+    table->pfnClearView = deviceEntry<clearView1, true>;
+    table->pfnCheckDirectFlipSupport = deviceEntry<checkDirectFlip>;
+    table->pfnDynamicConstantBufferMapNoOverwrite = deviceEntry<mapResource>;
+  } else {
+    table->pfnFlush = deviceEntry<flush>;
+    table->pfnResourceCopyRegion = deviceEntry<copyRegion, true>;
+    table->pfnResourceUpdateSubresourceUP = deviceEntry<updateResource, true>;
+    table->pfnDefaultConstantBufferUpdateSubresourceUP = deviceEntry<updateResource, true>;
+  }
   table->pfnCalcPrivateQuerySize = deviceEntry<querySize>;
   table->pfnCreateQuery = deviceEntry<createQuery>;
   table->pfnDestroyQuery = deviceEntry<destroyQuery>;
@@ -3177,16 +3256,16 @@ void populateDeviceFunctions(Table* table) {
   table->pfnDynamicConstantBufferUnmap = deviceEntry<unmapResource>;
   table->pfnDynamicResourceMapDiscard = deviceEntry<mapResource>;
   table->pfnDynamicResourceUnmap = deviceEntry<unmapResource>;
-  table->pfnCalcPrivateShaderSize = deviceEntry<shaderSize>;
+  table->pfnCalcPrivateShaderSize = deviceEntry<shaderSize<Signature>>;
   table->pfnSoSetTargets = deviceEntry<setStreamTargets>;
   table->pfnDestroyShader = deviceEntry<destroyShader>;
-  table->pfnVsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Vertex>>;
-  table->pfnGsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Geometry>>;
-  table->pfnPsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Pixel>>;
+  table->pfnVsSetConstantBuffers = constantBufferEntry<extended, dxvk::umd::ShaderStage::Vertex>();
+  table->pfnGsSetConstantBuffers = constantBufferEntry<extended, dxvk::umd::ShaderStage::Geometry>();
+  table->pfnPsSetConstantBuffers = constantBufferEntry<extended, dxvk::umd::ShaderStage::Pixel>();
   table->pfnSetViewports = deviceEntry<setViewports>;
   table->pfnSetScissorRects = deviceEntry<setScissors>;
-  table->pfnCalcPrivateRasterizerStateSize = deviceEntry<rasterizerSize>;
-  table->pfnCreateRasterizerState = deviceEntry<createRasterizer>;
+  table->pfnCalcPrivateRasterizerStateSize = deviceEntry<rasterizerSize<Raster>>;
+  table->pfnCreateRasterizerState = deviceEntry<createRasterizer<Raster>>;
   table->pfnDestroyRasterizerState = deviceEntry<destroyRasterizer>;
   table->pfnSetRasterizerState = deviceEntry<setRasterizer>;
   table->pfnIaSetIndexBuffer = deviceEntry<setIndexBuffer>;
@@ -3202,7 +3281,6 @@ void populateDeviceFunctions(Table* table) {
   table->pfnDrawIndexed = deviceEntry<drawIndexed, true>;
   table->pfnDrawInstanced = deviceEntry<drawInstanced, true>;
   table->pfnDrawIndexedInstanced = deviceEntry<drawIndexedInstanced, true>;
-  table->pfnFlush = deviceEntry<flush>;
   table->pfnCheckCounterInfo = deviceEntry<counterInfo>;
   table->pfnCheckCounter = deviceEntry<checkCounter>;
   table->pfnSetTextFilterSize = deviceEntry<setTextFilterSize>;
@@ -3230,14 +3308,16 @@ void populateDeviceFunctions(Table* table) {
     table->pfnRelocateDeviceFuncs = deviceEntry<relocateDeviceFunctions>;
   } else {
     table->pfnCreateRenderTargetView = deviceEntry<createTargetCubeArrays>;
-    table->pfnCalcPrivateBlendStateSize = deviceEntry<blendSize10_1>;
-    table->pfnCreateBlendState = deviceEntry<createBlend10_1>;
+    using Blend = std::conditional_t<extended, D3D11_1_DDI_BLEND_DESC, D3D10_1_DDI_BLEND_DESC>;
+    using Tessellation = std::conditional_t<extended, D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES, D3D11DDIARG_TESSELLATION_IO_SIGNATURES>;
+    table->pfnCalcPrivateBlendStateSize = deviceEntry<blendSize10_1<Blend>>;
+    table->pfnCreateBlendState = deviceEntry<createBlend10_1<Blend>>;
     table->pfnResourceConvert = deviceEntry<convertResource, true>;
-    table->pfnResourceConvertRegion = deviceEntry<convertResourceRegion, true>;
+    table->pfnResourceConvertRegion = table->pfnResourceCopyRegion;
     table->pfnCalcPrivateResourceSize = deviceEntry<resourceSize11>;
-    table->pfnCreateVertexShader = deviceEntry<createVertexShader11>;
-    table->pfnCreatePixelShader = deviceEntry<createPixelShader11>;
-    table->pfnCreateGeometryShader = deviceEntry<createGeometryShader11>;
+    table->pfnCreateVertexShader = deviceEntry<createVertexShader11<Signature>>;
+    table->pfnCreatePixelShader = deviceEntry<createPixelShader11<Signature>>;
+    table->pfnCreateGeometryShader = deviceEntry<createGeometryShader11<Signature>>;
     table->pfnVsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Vertex>>;
     table->pfnPsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Pixel>>;
     table->pfnGsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Geometry>>;
@@ -3247,10 +3327,10 @@ void populateDeviceFunctions(Table* table) {
     table->pfnCreateShaderResourceView = deviceEntry<createShaderView11>;
     table->pfnCalcPrivateDepthStencilViewSize = deviceEntry<depthViewSize11>;
     table->pfnCreateDepthStencilView = deviceEntry<createDepthView11>;
-    table->pfnCalcPrivateGeometryShaderWithStreamOutput = deviceEntry<geometryStreamSize11>;
-    table->pfnCreateGeometryShaderWithStreamOutput = deviceEntry<createGeometryStream11>;
+    table->pfnCalcPrivateGeometryShaderWithStreamOutput = deviceEntry<geometryStreamSize11<Signature>>;
+    table->pfnCreateGeometryShaderWithStreamOutput = deviceEntry<createGeometryStream11<Signature>>;
     table->pfnSetRenderTargets = deviceEntry<setRenderTargets11>;
-    table->pfnRelocateDeviceFuncs = deviceEntry<relocateDeviceFunctions11>;
+    table->pfnRelocateDeviceFuncs = deviceEntry<relocateDeviceFunctions11<Table>>;
     table->pfnDrawInstancedIndirect = deviceEntry<drawInstancedIndirect, true>;
     table->pfnDrawIndexedInstancedIndirect = deviceEntry<drawIndexedInstancedIndirect, true>;
     table->pfnHsSetShaderResources = deviceEntry<setShaderResources<dxvk::umd::ShaderStage::Hull>>;
@@ -3259,15 +3339,15 @@ void populateDeviceFunctions(Table* table) {
     table->pfnHsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Hull>>;
     table->pfnDsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Domain>>;
     table->pfnCsSetSamplers = deviceEntry<setSamplers<dxvk::umd::ShaderStage::Compute>>;
-    table->pfnHsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Hull>>;
-    table->pfnDsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Domain>>;
-    table->pfnCsSetConstantBuffers = deviceEntry<setConstantBuffers<dxvk::umd::ShaderStage::Compute>>;
+    table->pfnHsSetConstantBuffers = constantBufferEntry<extended, dxvk::umd::ShaderStage::Hull>();
+    table->pfnDsSetConstantBuffers = constantBufferEntry<extended, dxvk::umd::ShaderStage::Domain>();
+    table->pfnCsSetConstantBuffers = constantBufferEntry<extended, dxvk::umd::ShaderStage::Compute>();
     table->pfnHsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Hull>>;
     table->pfnDsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Domain>>;
     table->pfnCsSetShader = deviceEntry<setShader11<dxvk::umd::ShaderStage::Compute>>;
-    table->pfnCreateHullShader = deviceEntry<createHullShader11>;
-    table->pfnCreateDomainShader = deviceEntry<createDomainShader11>;
-    table->pfnCalcPrivateTessellationShaderSize = deviceEntry<tessellationSize>;
+    table->pfnCreateHullShader = deviceEntry<createHullShader11<Tessellation>>;
+    table->pfnCreateDomainShader = deviceEntry<createDomainShader11<Tessellation>>;
+    table->pfnCalcPrivateTessellationShaderSize = deviceEntry<tessellationSize<Tessellation>>;
     table->pfnPsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Pixel>>;
     table->pfnVsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Vertex>>;
     table->pfnGsSetShaderWithIfaces = deviceEntry<setShaderWithInterfaces11<dxvk::umd::ShaderStage::Geometry>>;
@@ -3294,7 +3374,7 @@ template<typename Table, typename Callbacks>
 HRESULT createDdiDevice(const dxvk::umd::AdapterIdentity& adapter, D3D10DDIARG_CREATEDEVICE* native,
                         Table* table, Callbacks* callbacks) {
   const auto h = native->hDrvDevice;
-  constexpr bool isD3D11 = std::is_same_v<Table, D3D11DDI_DEVICEFUNCS>;
+  constexpr bool isD3D11 = !std::is_same_v<Table, D3D10DDI_DEVICEFUNCS>;
   if (!h.pDrvPrivate || uintptr_t(h.pDrvPrivate) % alignof(DevicePrivate)
       || !callbacks || !callbacks->pfnSetErrorCb || !table
       || !native->hRTCoreLayer.handle) return E_INVALIDARG;
@@ -3320,9 +3400,7 @@ HRESULT createDdiDevice(const dxvk::umd::AdapterIdentity& adapter, D3D10DDIARG_C
   else device->callbacks10 = callbacks;
   device->memory.initialize(native->hRTDevice.handle, *native->pKTCallbacks,
     native->DXGIBaseDDI.pDXGIBaseCallbacks, adapter.gpuPublish);
-  const bool dxgi11 = dxvk::umd::nativeDxgiUses1_1(native->Interface, native->Version);
-  auto dxgiTable = dxgi11 ? nullptr : native->DXGIBaseDDI.pDXGIDDIBaseFunctions;
-  auto dxgiTable11 = dxgi11 ? native->DXGIBaseDDI.pDXGIDDIBaseFunctions2 : nullptr;
+
   const HRESULT hr = device->service->run([&] {
     const bool disableExtraThreads = native->Flags & D3D10DDI_CREATEDEVICE_FLAG_DISABLE_EXTRA_THREAD_CREATION;
     return dxvk::umd::createDevice(adapter.luid, device->featureLevel, disableExtraThreads,
@@ -3330,6 +3408,10 @@ HRESULT createDdiDevice(const dxvk::umd::AdapterIdentity& adapter, D3D10DDIARG_C
   });
   if (hr != S_OK) return FAILED(hr) ? hr : E_FAIL;
   if (!device->backend || !device->context) return E_FAIL;
+  if constexpr (std::is_same_v<Table, D3D11_1DDI_DEVICEFUNCS>) {
+    const auto hr1 = device->context.As(&device->context1);
+    if (FAILED(hr1)) return hr1;
+  }
   if constexpr (isD3D11) {
     // Backend construction can submit its own initialization buffers before
     // any DDI device/immediate context exists. Install the runtime opportunity
@@ -3345,27 +3427,32 @@ HRESULT createDdiDevice(const dxvk::umd::AdapterIdentity& adapter, D3D10DDIARG_C
     });
   }
   populateDeviceFunctions(table);
-  if (dxgiTable) {
-    *dxgiTable = {};
-    dxgiTable->pfnGetGammaCaps = getGammaCaps;
-    dxgiTable->pfnSetDisplayMode = setDisplayMode;
-    dxgiTable->pfnBlt = blt;
-    dxgiTable->pfnRotateResourceIdentities = rotateResourceIdentities;
-    dxgiTable->pfnQueryResourceResidency = queryResourceResidency;
-    dxgiTable->pfnSetResourcePriority = setResourcePriority;
-    if (device->memory.available()) dxgiTable->pfnPresent = present;
-  }
-  if (dxgiTable11) {
-    *dxgiTable11 = {};
-    dxgiTable11->pfnGetGammaCaps = getGammaCaps;
-    dxgiTable11->pfnSetDisplayMode = setDisplayMode;
-    dxgiTable11->pfnBlt = blt;
-    dxgiTable11->pfnRotateResourceIdentities = rotateResourceIdentities;
-    dxgiTable11->pfnQueryResourceResidency = queryResourceResidency;
-    dxgiTable11->pfnSetResourcePriority = setResourcePriority;
-    dxgiTable11->pfnResolveSharedResource = resolveSharedResource;
-    if (device->memory.available()) dxgiTable11->pfnPresent = present;
-  }
+  auto populateDxgi = [&](auto* functions) {
+    using Functions = std::remove_pointer_t<decltype(functions)>;
+    *functions = {};
+    functions->pfnGetGammaCaps = getGammaCaps;
+    functions->pfnSetDisplayMode = setDisplayMode;
+    functions->pfnBlt = blt<DXGI_DDI_ARG_BLT>;
+    functions->pfnRotateResourceIdentities = rotateResourceIdentities;
+    functions->pfnQueryResourceResidency = queryResourceResidency;
+    functions->pfnSetResourcePriority = setResourcePriority;
+    if (device->memory.available()) functions->pfnPresent = present;
+    if constexpr (!std::is_same_v<Functions, DXGI_DDI_BASE_FUNCTIONS>)
+      functions->pfnResolveSharedResource = resolveSharedResource;
+    if constexpr (std::is_same_v<Functions, DXGI1_2_DDI_BASE_FUNCTIONS>) {
+      functions->pfnBlt1 = blt<DXGI_DDI_ARG_BLT1>;
+      functions->pfnOfferResources = offerOrReclaim<DXGI_DDI_ARG_OFFERRESOURCES>;
+      functions->pfnReclaimResources = offerOrReclaim<DXGI_DDI_ARG_RECLAIMRESOURCES>;
+      functions->pfnGetMultiplaneOverlayCaps = overlayCaps;
+      functions->pfnCheckMultiplaneOverlaySupport = checkOverlay;
+    }
+  };
+  if constexpr (std::is_same_v<Table, D3D11_1DDI_DEVICEFUNCS>) {
+    populateDxgi(native->DXGIBaseDDI.pDXGIDDIBaseFunctions3);
+    if (native->ppfnRetrieveSubObject) *native->ppfnRetrieveSubObject = nullptr;
+  } else if (dxvk::umd::nativeDxgiUses1_1(native->Interface, native->Version))
+    populateDxgi(native->DXGIBaseDDI.pDXGIDDIBaseFunctions2);
+  else populateDxgi(native->DXGIBaseDDI.pDXGIDDIBaseFunctions);
   {
     std::lock_guard<std::mutex> lock(deviceStorageMutex);
     deviceStorage.at(h.pDrvPrivate).phase = DevicePhase::Live;
@@ -3382,5 +3469,7 @@ HRESULT dxvk::umd::createAdapterDevice(
   if (!args->pKTCallbacks || !args->hRTDevice.handle) return E_INVALIDARG;
   if (isD3D10Interface(args->Interface))
     return createDdiDevice(*identity, args, args->pDeviceFuncs, args->pUMCallbacks);
+  if (args->Interface == D3D11_1_DDI_INTERFACE_VERSION)
+    return createDdiDevice(*identity, args, args->p11_1DeviceFuncs, args->p11UMCallbacks);
   return createDdiDevice(*identity, args, args->p11DeviceFuncs, args->p11UMCallbacks);
 }

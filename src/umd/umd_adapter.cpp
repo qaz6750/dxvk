@@ -42,7 +42,7 @@ HRESULT APIENTRY closeAdapter(D3D10DDI_HADAPTER handle) {
 }
 HRESULT APIENTRY versions(D3D10DDI_HADAPTER handle, UINT* count, UINT64* output) {
   if (!count || !retain(handle)) return E_INVALIDARG;
-  constexpr UINT64 values[] = {D3D11_0_DDI_SUPPORTED, D3D11_0_7_DDI_SUPPORTED,
+  constexpr UINT64 values[] = {D3D11_1_DDI_SUPPORTED, D3D11_0_DDI_SUPPORTED, D3D11_0_7_DDI_SUPPORTED,
     D3D10_0_DDI_SUPPORTED, D3D10_0_7_DDI_SUPPORTED};
   const auto capacity = output ? *count : 0;
   *count = UINT(std::size(values));
@@ -58,6 +58,16 @@ HRESULT APIENTRY caps(D3D10DDI_HADAPTER handle, const D3D10_2DDIARG_GETCAPS* arg
       static_cast<D3D11DDI_3DPIPELINESUPPORT_CAPS*>(args->pData)->Caps =
         D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0);
       return S_OK;
+    case D3D11_1DDICAPS_D3D11_OPTIONS:
+      if (args->DataSize != sizeof(D3D11_1DDI_D3D11_OPTIONS_DATA)) return E_INVALIDARG;
+      break;
+    case D3D11_1DDICAPS_ARCHITECTURE_INFO:
+      if (args->DataSize != sizeof(D3D11_1DDI_ARCHITECTURE_INFO_DATA)) return E_INVALIDARG;
+      static_cast<D3D11_1DDI_ARCHITECTURE_INFO_DATA*>(args->pData)->TileBasedDeferredRenderer = TRUE;
+      return S_OK;
+    case D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT:
+      if (args->DataSize != sizeof(D3D11_DDI_SHADER_MIN_PRECISION_SUPPORT_DATA)) return E_INVALIDARG;
+      break;
     case D3D11DDICAPS_THREADING:
       if (args->DataSize != sizeof(D3D11DDI_THREADING_CAPS)) return E_INVALIDARG;
       break;

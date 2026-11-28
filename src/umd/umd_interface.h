@@ -16,6 +16,7 @@ inline bool supportedNativeInterface(UINT interfaceVersion, UINT version, UINT f
   }
   UINT build;
   switch (interfaceVersion) {
+    case D3D11_1_DDI_INTERFACE_VERSION: build = D3D11_1_DDI_BUILD_VERSION; break;
     case D3D11_0_DDI_INTERFACE_VERSION: build = D3D11_0_DDI_BUILD_VERSION; break;
     case D3D11_0_7_DDI_INTERFACE_VERSION: build = D3D11_0_7_DDI_BUILD_VERSION; break;
     default: return false;

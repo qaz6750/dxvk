@@ -1,14 +1,16 @@
 // Included in umd_ddi.cpp's private namespace. Every entry uses the exact SDK
 // D3D11 callback type and the same callable Device owner as the other DDIs.
-bool signatureRange11(const D3D10DDIARG_SIGNATURE_ENTRY* entries, UINT count) {
+template<typename Entry>
+bool signatureRange11(const Entry* entries, UINT count) {
   if (count > 128 || (count && !entries)) return false;
   for (UINT i = 0; i < count; ++i)
     if (!entries[i].Mask || (entries[i].Mask & ~15u) || UINT(entries[i].SystemValue) > 22
         || (entries[i].Register >= 32 && entries[i].Register != UINT(-1))) return false;
   return true;
 }
+template<typename Entry>
 void signatureOrdinals11(std::vector<dxvk::umd::ShaderIo11>& decoded,
-    const D3D10DDIARG_SIGNATURE_ENTRY* entries, UINT count) {
+    const Entry* entries, UINT count) {
   // The runtime union includes unused clip/cull registers. Its ordinal must
   // survive when a consumer uses only a later array element.
   for (auto& entry : decoded) if (entry.systemValue == 2 || entry.systemValue == 3) {
@@ -79,9 +81,10 @@ HRESULT compileNativeShader11(Device* device, Shader& shader, const dxvk::umd::S
   if (hr == S_OK) shader.compiledNative11 = std::move(binary);
   return hr;
 }
+template<typename Signature = D3D10DDIARG_STAGE_IO_SIGNATURES, typename Tessellation = D3D11DDIARG_TESSELLATION_IO_SIGNATURES>
 HRESULT createNativeShader11(Device* device, const UINT* code, D3D10DDI_HSHADER output,
-    dxvk::umd::ShaderStage stage, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature = nullptr,
-    const D3D11DDIARG_TESSELLATION_IO_SIGNATURES* tessellation = nullptr,
+    dxvk::umd::ShaderStage stage, const Signature* signature = nullptr,
+    const Tessellation* tessellation = nullptr,
     const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT* stream = nullptr,
     bool existingLegacyStorage = false) {
   using dxvk::umd::ShaderStage;
@@ -194,25 +197,30 @@ HRESULT createNativeShader10(Device* device, const UINT* code, D3D10DDI_HSHADER 
         || !dxvk::umd::shader10Profile(decoded, device->featureLevel >= D3D_FEATURE_LEVEL_10_1)
         || (stage == dxvk::umd::ShaderStage::Geometry && !dxvk::umd::shaderRasterPosition(decoded)))
       return E_INVALIDARG;
-    return createNativeShader11(device, code, output, stage, signature, nullptr, nullptr, true);
+    return createNativeShader11(device, code, output, stage, signature,
+      static_cast<const D3D11DDIARG_TESSELLATION_IO_SIGNATURES*>(nullptr), nullptr, true);
   } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
     catch (...) { return E_FAIL; }
 }
+template<typename Signature>
 void APIENTRY createVertexShader11(D3D10DDI_HDEVICE h, const UINT* code,
-    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature) {
+    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const Signature* signature) {
   get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Vertex, signature));
 }
+template<typename Signature>
 void APIENTRY createPixelShader11(D3D10DDI_HDEVICE h, const UINT* code,
-    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature) {
+    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const Signature* signature) {
   get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Pixel, signature));
 }
+template<typename Signature>
 void APIENTRY createGeometryShader11(D3D10DDI_HDEVICE h, const UINT* code,
-    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature) {
+    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const Signature* signature) {
   get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Geometry, signature));
 }
+template<typename Signature>
 void APIENTRY createGeometryStream11(D3D10DDI_HDEVICE h,
     const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT* stream, D3D10DDI_HSHADER output,
-    D3D10DDI_HRTSHADER, const D3D10DDIARG_STAGE_IO_SIGNATURES* signature) {
+    D3D10DDI_HRTSHADER, const Signature* signature) {
   if (!stream) { get(h)->error(E_INVALIDARG); return; }
   if (!stream->pShaderCode) {
     auto device = get(h);
@@ -256,15 +264,20 @@ void APIENTRY createGeometryStream11(D3D10DDI_HDEVICE h,
     device->error(hr);
     return;
   }
-  get(h)->error(createNativeShader11(get(h), stream->pShaderCode, output, dxvk::umd::ShaderStage::Geometry, signature, nullptr, stream));
+  get(h)->error(createNativeShader11(get(h), stream->pShaderCode, output, dxvk::umd::ShaderStage::Geometry,
+    signature, static_cast<const D3D11DDIARG_TESSELLATION_IO_SIGNATURES*>(nullptr), stream));
 }
+template<typename Signature>
 void APIENTRY createHullShader11(D3D10DDI_HDEVICE h, const UINT* code,
-    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const D3D11DDIARG_TESSELLATION_IO_SIGNATURES* signature) {
-  get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Hull, nullptr, signature));
+    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const Signature* signature) {
+  get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Hull,
+    static_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES*>(nullptr), signature));
 }
+template<typename Signature>
 void APIENTRY createDomainShader11(D3D10DDI_HDEVICE h, const UINT* code,
-    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const D3D11DDIARG_TESSELLATION_IO_SIGNATURES* signature) {
-  get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Domain, nullptr, signature));
+    D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER, const Signature* signature) {
+  get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Domain,
+    static_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES*>(nullptr), signature));
 }
 void APIENTRY createComputeShader11(D3D10DDI_HDEVICE h, const UINT* code, D3D10DDI_HSHADER output, D3D10DDI_HRTSHADER) {
   get(h)->error(createNativeShader11(get(h), code, output, dxvk::umd::ShaderStage::Compute));

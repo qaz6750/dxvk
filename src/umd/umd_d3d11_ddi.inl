@@ -84,11 +84,19 @@ void APIENTRY createResource11(D3D10DDI_HDEVICE h, const D3D11DDIARG_CREATERESOU
   publishNewResource(device, out, [&](Resource* staged) { return createResourceData11(device, args, staged, runtime); });
 }
 
-SIZE_T APIENTRY blendSize10_1(D3D10DDI_HDEVICE, const D3D10_1_DDI_BLEND_DESC*) { return sizeof(BlendState); }
-void APIENTRY createBlend10_1(D3D10DDI_HDEVICE h, const D3D10_1_DDI_BLEND_DESC* args,
+template<typename Desc>
+SIZE_T APIENTRY blendSize10_1(D3D10DDI_HDEVICE, const Desc*) { return sizeof(BlendState); }
+template<typename Desc>
+void APIENTRY createBlend10_1(D3D10DDI_HDEVICE h, const Desc* args,
     D3D10DDI_HBLENDSTATE out, D3D10DDI_HRTBLENDSTATE) {
   auto device = get(h);
   if (!args) { device->error(E_INVALIDARG); return; }
+  if constexpr (std::is_same_v<Desc, D3D11_1_DDI_BLEND_DESC>) {
+    const UINT count = args->IndependentBlendEnable ? 8 : 1;
+    for (UINT i = 0; i < count; ++i) {
+      if (args->RenderTarget[i].LogicOpEnable) { device->error(DXGI_ERROR_UNSUPPORTED); return; }
+    }
+  }
   const auto desc = dxvk::umd::blend11Desc(*args);
   const HRESULT hr = createViewStorage<BlendState>(device, out.pDrvPrivate, [&](BlendState& blend) {
     return device->backend->CreateBlendState(&desc, &blend.backend);
@@ -401,10 +409,13 @@ void APIENTRY setResourceMinLod(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE object, F
   device->context->SetResourceMinLOD(resource, lod);
 }
 
-SIZE_T APIENTRY tessellationSize(D3D10DDI_HDEVICE, const UINT*, const D3D11DDIARG_TESSELLATION_IO_SIGNATURES*) { return sizeof(Shader); }
+template<typename Signature>
+SIZE_T APIENTRY tessellationSize(D3D10DDI_HDEVICE, const UINT*, const Signature*) { return sizeof(Shader); }
+template<typename Signature>
 SIZE_T APIENTRY geometryStreamSize11(D3D10DDI_HDEVICE,
-    const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT*, const D3D10DDIARG_STAGE_IO_SIGNATURES*) { return sizeof(Shader); }
-void APIENTRY relocateDeviceFunctions11(D3D10DDI_HDEVICE h, D3D11DDI_DEVICEFUNCS* functions) {
+    const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT*, const Signature*) { return sizeof(Shader); }
+template<typename Table>
+void APIENTRY relocateDeviceFunctions11(D3D10DDI_HDEVICE h, Table* functions) {
   if (!functions) get(h)->error(E_INVALIDARG);
 }
 // The native Convert slots use the same format-cast bit-copy contract as
@@ -412,8 +423,4 @@ void APIENTRY relocateDeviceFunctions11(D3D10DDI_HDEVICE h, D3D11DDI_DEVICEFUNCS
 // these slots never interpret UINT/FLOAT/SRGB bytes as numeric conversion.
 void APIENTRY convertResource(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, D3D10DDI_HRESOURCE src) {
   copyResource(h, dst, src);
-}
-void APIENTRY convertResourceRegion(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, UINT dstIndex,
-    UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT srcIndex, const D3D10_DDI_BOX* box) {
-  copyRegion(h, dst, dstIndex, x, y, z, src, srcIndex, box);
 }

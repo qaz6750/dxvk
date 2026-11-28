@@ -14,7 +14,8 @@ struct StreamOutput {
   UINT strideCount = 0;
 };
 
-inline bool streamOutputPassthroughSignature(const D3D10DDIARG_STAGE_IO_SIGNATURES& native,
+template<typename Signature>
+inline bool streamOutputPassthroughSignature(const Signature& native,
     std::vector<ShaderSignatureEntry>& output) {
   output.clear();
   if (!native.NumOutputSignatureEntries || native.NumOutputSignatureEntries > 32

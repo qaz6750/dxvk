@@ -122,6 +122,8 @@ void RuntimeMemory::initialize(HANDLE rtDevice, const D3DDDI_DEVICECALLBACKS& cb
   callbacks.pfnSetDisplayModeCb = cb.pfnSetDisplayModeCb;
   callbacks.pfnQueryResidencyCb = cb.pfnQueryResidencyCb;
   callbacks.pfnSetPriorityCb = cb.pfnSetPriorityCb;
+  callbacks.pfnOfferAllocationsCb = cb.pfnOfferAllocationsCb;
+  callbacks.pfnReclaimAllocationsCb = cb.pfnReclaimAllocationsCb;
   callbacks.pfnCreateContextCb = cb.pfnCreateContextCb;
   callbacks.pfnDestroyContextCb = cb.pfnDestroyContextCb;
 }
@@ -516,6 +518,14 @@ HRESULT RuntimeMemory::queryResidency(const D3DKMT_HANDLE* handles, UINT count,
            value == D3DDDI_RESIDENCYSTATUS_RESIDENTINSHAREDMEMORY ||
            value == D3DDDI_RESIDENCYSTATUS_NOTRESIDENT;
   }, HRESULT(E_INVALIDARG), HRESULT(DXGI_ERROR_UNSUPPORTED), HRESULT(E_FAIL), HRESULT(DXGI_ERROR_DEVICE_REMOVED));
+}
+HRESULT RuntimeMemory::offer(const D3DDDICB_OFFERALLOCATIONS& request) {
+  if (!available() || !callbacks.pfnOfferAllocationsCb) return DXGI_ERROR_UNSUPPORTED;
+  return callbacks.pfnOfferAllocationsCb(device, &request);
+}
+HRESULT RuntimeMemory::reclaim(const D3DDDICB_RECLAIMALLOCATIONS& request) {
+  if (!available() || !callbacks.pfnReclaimAllocationsCb) return DXGI_ERROR_UNSUPPORTED;
+  return callbacks.pfnReclaimAllocationsCb(device, &request);
 }
 HRESULT RuntimeMemory::setPriority(D3DKMT_HANDLE handle, UINT priority, const Live& live) {
   if (!available() || !live()) return DXGI_ERROR_DEVICE_REMOVED;

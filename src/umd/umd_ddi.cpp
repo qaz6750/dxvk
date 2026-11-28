@@ -2672,7 +2672,7 @@ struct AllocationParticipant {
 };
 
 HRESULT captureAllocations(Device* device, const DXGI_DDI_HRESOURCE* resources,
-    UINT count, std::vector<AllocationParticipant>& participants) {
+    UINT count, std::vector<AllocationParticipant>& participants, bool allowBackendOnly = false) {
   participants.reserve(count);
   std::lock_guard<std::mutex> lock(resourceStorageMutex);
   if (device->retired) return DXGI_ERROR_DEVICE_REMOVED;
@@ -2682,10 +2682,10 @@ HRESULT captureAllocations(Device* device, const DXGI_DDI_HRESOURCE* resources,
     if (entry == resourceStorage.end() || entry->second.owner != device
         || entry->second.phase != ResourcePhase::Live) return E_INVALIDARG;
     auto allocation = resource->allocationOwner();
-    // Backend-only Vulkan allocations do not have a VidMm handle in this
-    // bridge. Never substitute a guessed resident answer or an opaque cookie.
-    if (!allocation || !allocation->handle()) return DXGI_DDI_ERR_UNSUPPORTED;
-    const auto handle = allocation->handle();
+    const D3DKMT_HANDLE handle = allocation ? allocation->handle() : 0;
+    // Offer/Reclaim can retain a backend-only resource. Residency and
+    // priority still require a real VidMm allocation.
+    if (!handle && (!allowBackendOnly || allocation || !resource->backend)) return DXGI_DDI_ERR_UNSUPPORTED;
     participants.push_back({resource, entry->second.reservation, std::move(allocation), handle});
   }
   return S_OK;
@@ -2698,7 +2698,7 @@ bool allocationsLiveLocked(Device* device, const std::vector<AllocationParticipa
     if (entry == resourceStorage.end() || entry->second.owner != device
         || entry->second.phase != ResourcePhase::Live
         || entry->second.reservation != participant.reservation
-        || participant.allocation->handle() != participant.handle) return false;
+        || (participant.allocation && participant.allocation->handle() != participant.handle)) return false;
   }
   return true;
 }

@@ -74,7 +74,8 @@ void APIENTRY clearView1(D3D10DDI_HDEVICE h, D3D11DDI_HANDLETYPE type, void* han
 template<typename Request>
 HRESULT APIENTRY offerOrReclaim(Request* args) {
   if (!args || !args->hDevice || !args->Resources || !args->pResources) return E_INVALIDARG;
-  DeviceOperation operation(reinterpret_cast<void*>(args->hDevice));
+  const auto request = *args;
+  DeviceOperation operation(reinterpret_cast<void*>(request.hDevice));
   if (!operation.owner) return DXGI_ERROR_DEVICE_REMOVED;
   dxvk::umd::RuntimeService::Scope scope(operation.owner->service.get());
   try {
@@ -82,26 +83,34 @@ HRESULT APIENTRY offerOrReclaim(Request* args) {
       DeviceOperation worker(operation.storage, operation.owner);
       auto device = operation.owner.get();
       std::vector<AllocationParticipant> participants;
-      HRESULT hr = captureAllocations(device, args->pResources, args->Resources, participants);
+      HRESULT hr = captureAllocations(device, request.pResources, request.Resources, participants, true);
       if (hr != S_OK) return hr;
       std::vector<D3DKMT_HANDLE> handles;
-      for (const auto& p : participants) handles.push_back(p.handle);
-      std::vector<BOOL> discarded;
-      if constexpr (std::is_same_v<Request, DXGI_DDI_ARG_OFFERRESOURCES>) {
-        hr = device->memory.offer({nullptr, handles.data(), args->Resources, args->Priority});
-      } else {
-        discarded.resize(handles.size());
-        hr = device->memory.reclaim({nullptr, handles.data(), discarded.data(), args->Resources});
+      for (const auto& p : participants) {
+        if (p.handle) handles.push_back(p.handle);
       }
-      if (hr != S_OK) return hr;
+      std::vector<BOOL> discarded;
+      if (!handles.empty()) {
+        const UINT count = UINT(handles.size());
+        if constexpr (std::is_same_v<Request, DXGI_DDI_ARG_OFFERRESOURCES>) {
+          hr = device->memory.offer({nullptr, handles.data(), count, request.Priority});
+        } else {
+          discarded.resize(count);
+          hr = device->memory.reclaim({nullptr, handles.data(), discarded.data(), count});
+        }
+        if (hr != S_OK) return hr;
+      }
       std::lock_guard<std::mutex> lock(resourceStorageMutex);
       if (!allocationsLiveLocked(device, participants)) return DXGI_ERROR_DEVICE_REMOVED;
       if constexpr (std::is_same_v<Request, DXGI_DDI_ARG_RECLAIMRESOURCES>) {
+        size_t nextHandle = 0;
         for (size_t i = 0; i < participants.size(); ++i) {
-          auto resource = static_cast<Resource*>(participants[i].storage);
-          if (discarded[i] && resource->shared) dxvk::umd::invalidateSharedSurface(*resource->shared);
+          const auto& p = participants[i];
+          const BOOL lost = p.handle ? discarded[nextHandle++] : FALSE;
+          auto resource = static_cast<Resource*>(p.storage);
+          if (lost && resource->shared) dxvk::umd::invalidateSharedSurface(*resource->shared);
+          if (request.pDiscarded) request.pDiscarded[i] = lost;
         }
-        if (args->pDiscarded) std::copy(discarded.begin(), discarded.end(), args->pDiscarded);
       }
       return S_OK;
     });
